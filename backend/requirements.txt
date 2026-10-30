@@ -1,0 +1,7 @@
+# Runtime dependencies for AI Animation Studio
+pydantic>=2.10.0,<3.0.0
+pydantic-settings>=2.7.0,<3.0.0
+fastapi>=0.115.0,<1.0.0
+uvicorn>=0.30.0,<1.0.0
+skia-python==144.1
+numpy>=2.0.0,<3.0.0

@@ -1,0 +1,54 @@
+# Python virtual environment and bytecode
+backend/.venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/dist-ssr/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Runtime data and artifacts
+data/*
+!data/.gitkeep
+projects/*
+!projects/.gitkeep
+
+# Rendered media outputs
+*.mp4
+*.wav
+*.mkv
+*.avi
+*.webm
+*.ass
+*.srt
+
+# Heavy generated/upscaled art assets (keep source and 2x only)
+*4x*
+*.upscaled.*
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
