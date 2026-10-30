@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 from backend.app.config import Settings, get_settings
 from backend.app.domain.project import utc_now
+from backend.app.domain.fact_check import ScriptFactCheckReport
 from backend.app.domain.script import (
     ID_REGEX,
     ConversationEvent,
@@ -29,12 +30,20 @@ from backend.app.llm.base import (
     LLMResponseMalformedError,
 )
 from backend.app.llm import get_llm_provider
+from backend.app.domain.research import (
+    EvidenceRecord,
+    PlannedQuery,
+    ResearchBudgetConstraints,
+    ResearchPlan,
+)
 from backend.app.services.project.service import (
     Project,
     ProjectNotFoundError,
     ProjectSecurityError,
     ProjectService,
 )
+from backend.app.services.research.evidence_brief import EvidenceBriefBuilder
+from backend.app.services.research.orchestrator import ResearchOrchestrator
 from backend.app.services.research.storage import (
     ResearchRunNotFoundError,
     ResearchSecurityError,
@@ -63,6 +72,9 @@ from backend.app.services.scriptwriter.outliner import (
     ScriptOutlinerUnavailableError,
     ValidatedEvidenceCatalog,
 )
+from backend.app.services.scriptwriter.classifier import classify_claim_risk
+from backend.app.services.scriptwriter.fact_checker import ScriptFactChecker
+from backend.app.services.scriptwriter.repairer import ScriptRepairer
 
 
 class ScriptError(Exception):
@@ -174,6 +186,9 @@ class ScriptService:
         project_service: Optional[ProjectService] = None,
         llm_provider: Optional[LLMProvider] = None,
         research_storage: Optional[ResearchStorageService] = None,
+        research_orchestrator: Optional[ResearchOrchestrator] = None,
+        fact_checker: Optional[ScriptFactChecker] = None,
+        repairer: Optional[ScriptRepairer] = None,
         settings: Optional[Settings] = None,
     ) -> None:
         self.settings = settings or get_settings()
@@ -181,6 +196,7 @@ class ScriptService:
         self.project_service = project_service or ProjectService(settings=self.settings)
         self.llm_provider = llm_provider or get_llm_provider(settings=self.settings)
         self.research_storage = research_storage or ResearchStorageService(settings=self.settings)
+        self.research_orchestrator = research_orchestrator
         self.outliner = ScriptOutliner(
             llm_provider=self.llm_provider,
             research_storage=self.research_storage,
@@ -193,6 +209,16 @@ class ScriptService:
             project_service=self.project_service,
             settings=self.settings,
         )
+        self.fact_checker = fact_checker or ScriptFactChecker(
+            llm_provider=self.llm_provider,
+            settings=self.settings,
+            discover_candidates=True,
+        )
+        self.repairer = repairer or ScriptRepairer(
+            llm_provider=self.llm_provider,
+            fact_checker=self.fact_checker,
+            settings=self.settings,
+        )
 
     def _get_project_dirs(self, project_id: str) -> Dict[str, Path]:
         """Validate project exists and resolve script directories."""
@@ -201,9 +227,11 @@ class ScriptService:
         versions_dir = script_dir / "versions"
         finalized_dir = script_dir / "finalized"
         outlines_dir = script_dir / "outlines"
+        fact_checks_dir = script_dir / "fact_checks"
         versions_dir.mkdir(parents=True, exist_ok=True)
         finalized_dir.mkdir(parents=True, exist_ok=True)
         outlines_dir.mkdir(parents=True, exist_ok=True)
+        fact_checks_dir.mkdir(parents=True, exist_ok=True)
 
         return {
             "project_dir": project.root_dir,
@@ -211,6 +239,7 @@ class ScriptService:
             "versions_dir": versions_dir,
             "finalized_dir": finalized_dir,
             "outlines_dir": outlines_dir,
+            "fact_checks_dir": fact_checks_dir,
             "current_file": script_dir / "current.json",
             "conversation_file": script_dir / "conversation.json",
             "state_file": script_dir / "workflow_state.json",
@@ -351,6 +380,110 @@ class ScriptService:
             existing_nums.add(current_version)
 
         return max(existing_nums, default=0) + 1
+
+    def _commit_script_version(
+        self,
+        project_id: str,
+        dirs: Dict[str, Path],
+        script: Script,
+        report: ScriptFactCheckReport,
+        event_type: ConversationEventType,
+        event_content: str,
+        event_metadata: Optional[Dict[str, Any]] = None,
+        prior_instruction: Optional[str] = None,
+        prior_version: Optional[int] = None,
+    ) -> None:
+        """Atomically commit a script version and its matching fact-check report in strict sequence.
+
+        Strict commit sequence:
+        1. Validate candidate script
+        2. Validate corresponding fact-check report
+        3. Persist immutable script snapshot (versions/vNNN.json)
+        4. Persist matching immutable fact-check report (fact_checks/vNNN.json)
+        5. Update current.json
+        6. Update workflow state (reset accepted/rejected version)
+        7. Emit conversation events
+        """
+        # 1. Validate candidate script
+        try:
+            Script.model_validate(script)
+            script.validate_content()
+        except Exception as val_err:
+            raise ScriptValidationError(f"Candidate script v{script.version} is invalid: {val_err}") from val_err
+
+        # 2. Validate matching fact-check report
+        try:
+            ScriptFactCheckReport.model_validate(report)
+        except Exception as rep_err:
+            raise ScriptValidationError(f"Fact-check report for v{script.version} is invalid: {rep_err}") from rep_err
+
+        if report.script_version != script.version:
+            raise ScriptValidationError(
+                f"Fact-check report version mismatch: report is for v{report.script_version}, script is v{script.version}."
+            )
+        if report.project_id != project_id:
+            raise ScriptValidationError(
+                f"Fact-check report project mismatch: report is for '{report.project_id}', expected '{project_id}'."
+            )
+        if report.research_run_id != script.research_run_id:
+            raise ScriptValidationError(
+                f"Fact-check report research provenance mismatch: report is grounded in '{report.research_run_id}', "
+                f"but script v{script.version} requires '{script.research_run_id}'."
+            )
+
+        # 3. Persist immutable script snapshot
+        version_file = dirs["versions_dir"] / f"v{script.version:03d}.json"
+        if version_file.exists():
+            raise ScriptStorageError(f"Snapshot version file '{version_file.name}' already exists.")
+
+        try:
+            _atomic_write_json(version_file, script.model_dump(mode="json"))
+        except Exception as exc:
+            raise ScriptStorageError(f"Failed to persist script snapshot '{version_file}': {exc}") from exc
+
+        # 4. Persist matching immutable fact-check report
+        report_file = dirs["fact_checks_dir"] / f"v{script.version:03d}.json"
+        if report_file.exists():
+            raise ScriptStorageError(
+                f"Fact-check report for version {report.script_version} already exists at '{report_file.name}' and is immutable."
+            )
+
+        try:
+            _atomic_write_json(report_file, report.model_dump(mode="json"))
+        except Exception as exc:
+            raise ScriptStorageError(f"Failed to persist fact-check report '{report_file}': {exc}") from exc
+
+        # 5. Update current.json pointer
+        try:
+            _atomic_write_json(dirs["current_file"], script.model_dump(mode="json"))
+        except Exception as exc:
+            raise ScriptStorageError(f"Failed to update current working draft pointer: {exc}") from exc
+
+        # 6. Reset workflow state for this active version
+        self._save_workflow_state(
+            dirs["state_file"],
+            {
+                "accepted_version": None,
+                "rejected_version": None,
+                "rejection_reason": None,
+            },
+        )
+
+        # 7. Append conversation events
+        if prior_instruction and prior_version is not None:
+            self._append_conversation_event(
+                dirs["conversation_file"],
+                event_type="revision_instruction",
+                content=prior_instruction,
+                script_version=prior_version,
+            )
+        self._append_conversation_event(
+            dirs["conversation_file"],
+            event_type=event_type,
+            content=event_content,
+            script_version=script.version,
+            metadata=event_metadata,
+        )
 
     def create_outline(
         self,
@@ -542,47 +675,88 @@ class ScriptService:
         generated.updated_at = utc_now()
         populate_script_duration_metrics(generated, words_per_minute=self.words_per_minute)
 
-        # 4. Strict validation before any disk replacement
-        try:
-            Script.model_validate(generated)
-            generated.validate_content()
-        except Exception as val_err:
-            raise ScriptValidationError(f"Generated script is invalid: {val_err}") from val_err
+        # 4. Automatic Fact-Checking of initial draft
+        is_researched, evidence_catalog = self._resolve_revision_catalog(project_id, generated)
+        catalog = evidence_catalog if is_researched else None
 
-        # 5. Atomic persistence: snapshot first, then current working copy
-        version_file = dirs["versions_dir"] / f"v{version:03d}.json"
-        if version_file.exists():
-            raise ScriptStorageError(f"Snapshot version file '{version_file.name}' already exists.")
-
-        _atomic_write_json(version_file, generated.model_dump(mode="json"))
-        _atomic_write_json(dirs["current_file"], generated.model_dump(mode="json"))
-
-        # 6. Reset workflow state
-        self._save_workflow_state(
-            dirs["state_file"],
-            {
-                "accepted_version": None,
-                "rejected_version": None,
-                "rejection_reason": None,
-            },
+        initial_report = self.fact_checker.check_script(
+            script=generated,
+            catalog=catalog,
+            project_id=project_id,
         )
+        initial_report.script_version = version
 
-        # 7. Append conversation events
-        self._append_conversation_event(
-            dirs["conversation_file"],
+        # 5. Strict 7-step atomic persistence for initial version (v1)
+        self._commit_script_version(
+            project_id=project_id,
+            dirs=dirs,
+            script=generated,
+            report=initial_report,
             event_type="draft_generated",
-            content=generated.title,
-            script_version=version,
-            metadata={
+            event_content=generated.title,
+            event_metadata={
                 "sections_count": len(generated.sections),
                 "research_run_id": generated.research_run_id,
             },
         )
 
-        # 8. Update project stage metadata
+        active_script = generated
+
+        # 6. Automatic single-pass surgical repair if required
+        if initial_report.requires_repair and is_researched and catalog:
+            all_known_ids = self._collect_all_known_claim_ids(generated, dirs)
+            repair_result = self.repairer.repair_script(
+                script=generated,
+                report=initial_report,
+                catalog=catalog,
+                all_known_claim_ids=all_known_ids,
+            )
+
+            narration_changed = any(
+                orig_sec.narration != rep_sec.narration
+                for orig_sec, rep_sec in zip(generated.sections, repair_result.repaired_script.sections)
+            ) or (len(generated.sections) != len(repair_result.repaired_script.sections))
+            claims_changed = (
+                [c.claim_id for c in generated.claims] != [c.claim_id for c in repair_result.repaired_script.claims]
+                or any(
+                    orig_c.claim_text != rep_c.claim_text
+                    for orig_c, rep_c in zip(generated.claims, repair_result.repaired_script.claims)
+                    if orig_c.claim_id == rep_c.claim_id
+                )
+            )
+
+            if narration_changed or claims_changed:
+                v2 = self._allocate_next_version(dirs, current_version=version)
+                repaired = repair_result.repaired_script
+                repaired.version = v2
+                repaired.project_id = project_id
+                repaired.status = "draft"
+                repaired.updated_at = utc_now()
+                populate_script_duration_metrics(repaired, words_per_minute=self.words_per_minute)
+
+                repair_report = repair_result.fact_check_report
+                repair_report.script_version = v2
+
+                # Strict 7-step atomic persistence for repaired version (v2)
+                self._commit_script_version(
+                    project_id=project_id,
+                    dirs=dirs,
+                    script=repaired,
+                    report=repair_report,
+                    event_type="draft_generated",
+                    event_content=f"Repaired draft: {repaired.title}",
+                    event_metadata={
+                        "repaired_from_version": version,
+                        "attempted_claims": repair_result.attempted_claims_count,
+                        "resolved_claims": repair_result.resolved_claims_count,
+                    },
+                )
+                active_script = repaired
+
+        # 10. Update project stage metadata
         self.project_service.update_stage_status(project_id, "script", "in_progress")
 
-        return generated
+        return active_script
 
     def _resolve_revision_catalog(
         self, project_id: str, script: Script
@@ -726,6 +900,15 @@ class ScriptService:
                 assigned_claim_id = matched_prior.claim_id
                 used_prior_claim_ids.add(matched_prior.claim_id)
 
+                # Risk level preservation: never silently downgrade high-risk claims
+                prior_risk = getattr(matched_prior, "risk_level", None)
+                if prior_risk == "high":
+                    assigned_risk = "high"
+                elif prior_risk:
+                    assigned_risk = prior_risk
+                else:
+                    assigned_risk = classify_claim_risk(rev_c.claim_text.strip(), rev_c.section_id)
+
                 if is_researched:
                     # If revised claim explicitly cites evidence, use valid ones
                     if rev_c.evidence_ids:
@@ -751,6 +934,7 @@ class ScriptService:
             else:
                 # 2. New or materially changed claim -> allocate new unique ID; NEVER inherit prior evidence
                 assigned_claim_id = self._allocate_claim_id(all_known_claim_ids)
+                assigned_risk = classify_claim_risk(rev_c.claim_text.strip(), rev_c.section_id)
 
                 if is_researched:
                     valid_eids = [
@@ -775,6 +959,7 @@ class ScriptService:
                     section_id=rev_c.section_id,
                     evidence_ids=valid_eids,
                     source_ids=derived_sources,
+                    risk_level=assigned_risk,
                     link_status=link_status,
                 )
             )
@@ -819,6 +1004,8 @@ class ScriptService:
         self,
         project_id: str,
         instruction: str,
+        override_research_run_id: Optional[str] = None,
+        override_catalog: Optional[ValidatedEvidenceCatalog] = None,
     ) -> Script:
         """Revise the active script draft based on natural-language feedback with evidence and claim integrity."""
         clean_inst = (instruction or "").strip()
@@ -838,7 +1025,11 @@ class ScriptService:
             raise ScriptStorageError(f"Cannot read current draft for project '{project_id}': {exc}") from exc
 
         # 1. Resolve research catalog and run status
-        is_researched, evidence_catalog = self._resolve_revision_catalog(project_id, current_script)
+        if override_catalog is not None:
+            is_researched = True
+            evidence_catalog = override_catalog
+        else:
+            is_researched, evidence_catalog = self._resolve_revision_catalog(project_id, current_script)
 
         # 2. Calculate next version
         next_version = self._allocate_next_version(dirs, current_version=current_script.version)
@@ -919,55 +1110,95 @@ class ScriptService:
         raw_revised.version = next_version
         raw_revised.status = "draft"
         raw_revised.updated_at = utc_now()
-        if current_script.research_run_id and not raw_revised.research_run_id:
-            raw_revised.research_run_id = current_script.research_run_id
+        if override_research_run_id:
+            raw_revised.research_run_id = override_research_run_id
+            raw_revised.evidence_brief_path = f"research/runs/{override_research_run_id}/evidence_brief.md"
+        else:
+            if current_script.research_run_id and not raw_revised.research_run_id:
+                raw_revised.research_run_id = current_script.research_run_id
+            if getattr(current_script, "evidence_brief_path", None) and not getattr(raw_revised, "evidence_brief_path", None):
+                raw_revised.evidence_brief_path = current_script.evidence_brief_path
         if getattr(current_script, "outline", None) and not getattr(raw_revised, "outline", None):
             raw_revised.outline = current_script.outline
-        if getattr(current_script, "evidence_brief_path", None) and not getattr(raw_revised, "evidence_brief_path", None):
-            raw_revised.evidence_brief_path = current_script.evidence_brief_path
 
         populate_script_duration_metrics(raw_revised, words_per_minute=self.words_per_minute)
 
-        # 9. Strict validation before disk persistence
-        try:
-            Script.model_validate(raw_revised)
-            raw_revised.validate_content()
-        except Exception as val_err:
-            raise ScriptValidationError(f"Revised script is invalid: {val_err}") from val_err
-
-        # 10. Atomic persistence: snapshot first, then current working copy
-        version_file = dirs["versions_dir"] / f"v{next_version:03d}.json"
-        if version_file.exists():
-            raise ScriptStorageError(f"Snapshot version file '{version_file.name}' already exists.")
-
-        _atomic_write_json(version_file, raw_revised.model_dump(mode="json"))
-        _atomic_write_json(dirs["current_file"], raw_revised.model_dump(mode="json"))
-
-        # 11. Reset workflow acceptance state for the new revision
-        self._save_workflow_state(
-            dirs["state_file"],
-            {
-                "accepted_version": None,
-                "rejected_version": None,
-                "rejection_reason": None,
-            },
+        # 9. Automatic Fact-Checking of revision candidate
+        rev_catalog = evidence_catalog if is_researched else None
+        rev_report = self.fact_checker.check_script(
+            script=raw_revised,
+            catalog=rev_catalog,
+            project_id=project_id,
         )
+        rev_report.script_version = next_version
+        if raw_revised.research_run_id:
+            rev_report.research_run_id = raw_revised.research_run_id
 
-        # 12. Record events
-        self._append_conversation_event(
-            dirs["conversation_file"],
-            event_type="revision_instruction",
-            content=clean_inst,
-            script_version=current_script.version,
-        )
-        self._append_conversation_event(
-            dirs["conversation_file"],
+        # 10. Strict 7-step atomic persistence for candidate revision
+        self._commit_script_version(
+            project_id=project_id,
+            dirs=dirs,
+            script=raw_revised,
+            report=rev_report,
             event_type="revision_result",
-            content=f"Created version {next_version}",
-            script_version=next_version,
+            event_content=f"Created version {next_version}",
+            prior_instruction=clean_inst,
+            prior_version=current_script.version,
         )
 
-        return raw_revised
+        active_revised = raw_revised
+
+        # 11. Automatic single-pass surgical repair if required
+        if rev_report.requires_repair and is_researched and rev_catalog:
+            repair_result = self.repairer.repair_script(
+                script=raw_revised,
+                report=rev_report,
+                catalog=rev_catalog,
+                all_known_claim_ids=all_known_ids,
+            )
+
+            narration_changed = any(
+                orig_sec.narration != rep_sec.narration
+                for orig_sec, rep_sec in zip(raw_revised.sections, repair_result.repaired_script.sections)
+            ) or (len(raw_revised.sections) != len(repair_result.repaired_script.sections))
+            claims_changed = (
+                [c.claim_id for c in raw_revised.claims] != [c.claim_id for c in repair_result.repaired_script.claims]
+                or any(
+                    orig_c.claim_text != rep_c.claim_text
+                    for orig_c, rep_c in zip(raw_revised.claims, repair_result.repaired_script.claims)
+                    if orig_c.claim_id == rep_c.claim_id
+                )
+            )
+
+            if narration_changed or claims_changed:
+                v_rep = self._allocate_next_version(dirs, current_version=next_version)
+                repaired = repair_result.repaired_script
+                repaired.version = v_rep
+                repaired.project_id = project_id
+                repaired.status = "draft"
+                repaired.updated_at = utc_now()
+                populate_script_duration_metrics(repaired, words_per_minute=self.words_per_minute)
+
+                repair_report = repair_result.fact_check_report
+                repair_report.script_version = v_rep
+
+                # Strict 7-step atomic persistence for repaired revision
+                self._commit_script_version(
+                    project_id=project_id,
+                    dirs=dirs,
+                    script=repaired,
+                    report=repair_report,
+                    event_type="revision_result",
+                    event_content=f"Created repaired revision version {v_rep}",
+                    event_metadata={
+                        "repaired_from_version": next_version,
+                        "attempted_claims": repair_result.attempted_claims_count,
+                        "resolved_claims": repair_result.resolved_claims_count,
+                    },
+                )
+                active_revised = repaired
+
+        return active_revised
 
     def accept_draft(self, project_id: str) -> Script:
         """Mark the active draft as accepted for finalization."""
@@ -1032,7 +1263,54 @@ class ScriptService:
                 "Call accept_draft first."
             )
 
-        # 2. Strict validation as a finalized script
+        # 2. Fact-checking readiness check per approved risk policy
+        report_file = dirs["fact_checks_dir"] / f"v{current.version:03d}.json"
+        if not report_file.exists():
+            # Legacy script exception: created before Phase 5 with no claims, no fact-check reports, and no research-run ID
+            is_legacy = (
+                len(current.claims) == 0
+                and not any(dirs["fact_checks_dir"].glob("v*.json"))
+                and current.research_run_id is None
+            )
+            if not is_legacy:
+                raise ScriptFinalizationError(
+                    f"Draft v{current.version} cannot be finalized because its mandatory fact-check report is missing. "
+                    "Fact-check the draft before finalization."
+                )
+            fc_report = None
+        else:
+            try:
+                fc_report = self.get_fact_check_report(project_id, current.version)
+            except (ScriptStorageError, ScriptValidationError, Exception) as exc:
+                raise ScriptFinalizationError(
+                    f"Draft v{current.version} cannot be finalized because its fact-check report is invalid or malformed: {exc}"
+                ) from exc
+
+            if fc_report.project_id != project_id or fc_report.script_version != current.version:
+                raise ScriptFinalizationError(
+                    f"Draft v{current.version} cannot be finalized because its fact-check report has mismatched metadata "
+                    f"(report version {fc_report.script_version}, project '{fc_report.project_id}')."
+                )
+
+            if fc_report.research_run_id != current.research_run_id:
+                raise ScriptFinalizationError(
+                    f"Draft v{current.version} cannot be finalized because its fact-check report has mismatched research provenance "
+                    f"(report run '{fc_report.research_run_id}', script run '{current.research_run_id}')."
+                )
+
+            if not fc_report.is_ready:
+                unresolved_reasons = []
+                if fc_report.contradicted_count > 0:
+                    unresolved_reasons.append(f"{fc_report.contradicted_count} contradicted claim(s)")
+                if fc_report.has_unresolved_high_risk:
+                    unresolved_reasons.append("unresolved high-risk claim(s)")
+                reason_str = ", ".join(unresolved_reasons) if unresolved_reasons else fc_report.readiness_reason
+                raise ScriptFinalizationError(
+                    f"Draft v{current.version} cannot be finalized because it is not ready for review: {reason_str}. "
+                    "Repair or revise the script before finalization."
+                )
+
+        # 3. Strict validation as a finalized script
         try:
             current.validate_content()
         except Exception as val_err:
@@ -1167,3 +1445,483 @@ class ScriptService:
             raise ScriptStorageError(
                 f"Failed to read conversation history for project '{project_id}': {exc}"
             ) from exc
+
+    def save_fact_check_report(self, project_id: str, report: ScriptFactCheckReport) -> Path:
+        """Persist a version-aligned fact-check report atomically with overwrite protection."""
+        if not report or not isinstance(report, ScriptFactCheckReport):
+            raise ScriptValidationError("Invalid report object provided to save_fact_check_report.")
+        if report.project_id != project_id:
+            raise ScriptValidationError(
+                f"Report project_id '{report.project_id}' does not match target project_id '{project_id}'."
+            )
+        if report.script_version < 1:
+            raise ScriptValidationError(f"Invalid script_version {report.script_version}; must be >= 1.")
+
+        dirs = self._get_project_dirs(project_id)
+        report_file = dirs["fact_checks_dir"] / f"v{report.script_version:03d}.json"
+
+        # Overwrite protection for historical audit integrity
+        if report_file.exists():
+            raise ScriptStorageError(
+                f"Fact-check report for version {report.script_version} already exists at '{report_file.name}' "
+                "and is immutable."
+            )
+
+        try:
+            report_data = report.model_dump(mode="json")
+            _atomic_write_json(report_file, report_data)
+        except Exception as exc:
+            raise ScriptStorageError(f"Failed to persist fact-check report to '{report_file}': {exc}") from exc
+
+        return report_file
+
+    def get_fact_check_report(self, project_id: str, version: int) -> ScriptFactCheckReport:
+        """Retrieve the persisted fact-check report for a specific script version."""
+        if version < 1:
+            raise ScriptValidationError(f"Invalid script version {version}; must be >= 1.")
+
+        dirs = self._get_project_dirs(project_id)
+        report_file = dirs["fact_checks_dir"] / f"v{version:03d}.json"
+
+        if not report_file.exists():
+            raise ScriptNotFoundError(
+                f"Fact-check report for version {version} not found in project '{project_id}'."
+            )
+
+        try:
+            raw = json.loads(report_file.read_text(encoding="utf-8"))
+            return ScriptFactCheckReport.model_validate(raw)
+        except Exception as exc:
+            raise ScriptStorageError(f"Corrupt or invalid fact-check report at '{report_file}': {exc}") from exc
+
+    def get_current_fact_check_report(self, project_id: str) -> Optional[ScriptFactCheckReport]:
+        """Retrieve the persisted fact-check report for the active current draft."""
+        current = self.get_current_script(project_id)
+        dirs = self._get_project_dirs(project_id)
+        report_file = dirs["fact_checks_dir"] / f"v{current.version:03d}.json"
+        if not report_file.exists():
+            return None
+        return self.get_fact_check_report(project_id, current.version)
+
+    def list_fact_check_reports(self, project_id: str) -> List[ScriptFactCheckReport]:
+        """List all persisted fact-check reports for a project, sorted by script version ascending."""
+        dirs = self._get_project_dirs(project_id)
+        files = sorted(dirs["fact_checks_dir"].glob("v*.json"))
+        reports: List[ScriptFactCheckReport] = []
+
+        for f in files:
+            try:
+                raw = json.loads(f.read_text(encoding="utf-8"))
+                reports.append(ScriptFactCheckReport.model_validate(raw))
+            except Exception as exc:
+                raise ScriptStorageError(f"Corrupt fact-check report file at '{f}': {exc}") from exc
+
+        return reports
+
+    def challenge_claim(
+        self,
+        project_id: str,
+        claim_id: str,
+        instruction: Optional[str] = None,
+        action: Optional[str] = "investigate",
+    ) -> Dict[str, Any]:
+        """Execute a conversational fact challenge on a specific script claim per Phase 6 specifications."""
+        clean_cid = (claim_id or "").strip()
+        if not clean_cid or not re.match(r"^clm_\d+$", clean_cid):
+            raise ScriptValidationError(f"Invalid claim ID '{claim_id}'. Claim IDs must match 'clm_NN'.")
+
+        action_clean = (action or "investigate").lower().strip()
+        if action_clean not in ("investigate", "remove", "qualify", "rephrase"):
+            raise ScriptValidationError(
+                f"Invalid challenge action '{action}'. Permitted actions: 'investigate', 'remove', 'qualify', 'rephrase'."
+            )
+
+        dirs = self._get_project_dirs(project_id)
+        if not dirs["current_file"].exists():
+            raise ScriptNotFoundError(f"No active script draft found for project '{project_id}'. Call start_script first.")
+
+        try:
+            current_data = json.loads(dirs["current_file"].read_text(encoding="utf-8"))
+            current_script = Script.model_validate(current_data)
+        except Exception as exc:
+            raise ScriptStorageError(f"Cannot read current draft for project '{project_id}': {exc}") from exc
+
+        # 1. Identify the target claim and its section
+        target_claim = next((c for c in current_script.claims if c.claim_id == clean_cid), None)
+        if not target_claim:
+            raise ScriptValidationError(f"Claim '{clean_cid}' not found in active script draft for project '{project_id}'.")
+
+        is_active_in_narration = any(clean_cid in sec.claim_ids for sec in current_script.sections)
+        if not is_active_in_narration:
+            raise ScriptValidationError(f"Claim '{clean_cid}' is not currently active in any section narration.")
+
+        target_section = next((s for s in current_script.sections if s.id == target_claim.section_id), None)
+        if not target_section:
+            raise ScriptValidationError(f"Section '{target_claim.section_id}' for claim '{clean_cid}' not found in script.")
+
+        # 2. Check research status and resolve catalog
+        is_researched, evidence_catalog = self._resolve_revision_catalog(project_id, current_script)
+
+        # Retrieve prior assessment if available
+        prior_report = self.get_current_fact_check_report(project_id)
+        prior_assessment = None
+        if prior_report:
+            prior_assessment = next((a for a in prior_report.assessments if a.claim_id == clean_cid), None)
+        prior_status = (
+            prior_assessment.status
+            if prior_assessment
+            else (target_claim.assessment_status or "not_checked")
+        )
+
+        if not is_researched:
+            investigation_note = "Script is unresearched: external evidence re-investigation is unavailable without research grounding."
+        else:
+            linked_count = sum(1 for eid in target_claim.evidence_ids if eid in evidence_catalog.evidence_by_id)
+            investigation_note = (
+                f"Checked against existing research catalog for run '{evidence_catalog.run_id}' "
+                f"({linked_count} linked evidence records in catalog; no new external web queries executed)."
+            )
+
+        # 3. Handle Action: Remove
+        if action_clean == "remove":
+            orig_narration = target_section.narration
+            sentences = re.split(r"(?<=[.!?])\s+", orig_narration)
+            target_span = None
+            for sent in sentences:
+                if target_claim.claim_text.lower() in sent.lower() or _is_same_factual_proposition(sent, target_claim.claim_text):
+                    target_span = sent
+                    break
+            if not target_span:
+                target_tokens = set(_extract_content_tokens(target_claim.claim_text))
+                best_score = 0
+                for sent in sentences:
+                    sent_tokens = set(_extract_content_tokens(sent))
+                    overlap = len(target_tokens & sent_tokens)
+                    if overlap > best_score:
+                        best_score = overlap
+                        target_span = sent
+
+            if target_span and target_span in orig_narration:
+                new_narration = orig_narration.replace(target_span, "").strip()
+            else:
+                new_narration = orig_narration
+
+            new_narration = re.sub(r" +", " ", new_narration)
+            new_narration = re.sub(r" ([.,!?;:])", r"\1", new_narration)
+            new_narration = re.sub(r"\.{2,}", ".", new_narration).strip()
+            if not new_narration:
+                new_narration = f"{target_section.heading} continues."
+
+            updated_sections = []
+            for s in current_script.sections:
+                if s.id == target_section.id:
+                    updated_s = s.model_copy(
+                        update={
+                            "narration": new_narration,
+                            "claim_ids": [cid for cid in s.claim_ids if cid != clean_cid],
+                        }
+                    )
+                    updated_sections.append(updated_s)
+                else:
+                    updated_sections.append(s.model_copy(deep=True))
+
+            updated_claims = []
+            for c in current_script.claims:
+                if c.claim_id == clean_cid:
+                    updated_c = c.model_copy(
+                        update={
+                            "evidence_ids": [],
+                            "source_ids": [],
+                            "link_status": "unlinked",
+                            "assessment_status": "not_checked",
+                        }
+                    )
+                    updated_claims.append(updated_c)
+                else:
+                    updated_claims.append(c.model_copy(deep=True))
+
+            next_version = self._allocate_next_version(dirs, current_version=current_script.version)
+            revised_script = current_script.model_copy(deep=True)
+            revised_script.version = next_version
+            revised_script.status = "draft"
+            revised_script.sections = updated_sections
+            revised_script.claims = updated_claims
+            revised_script.updated_at = utc_now()
+            populate_script_duration_metrics(revised_script, words_per_minute=self.words_per_minute)
+
+            rev_catalog = evidence_catalog if is_researched else None
+            rev_report = self.fact_checker.check_script(
+                script=revised_script,
+                catalog=rev_catalog,
+                project_id=project_id,
+            )
+            rev_report.script_version = next_version
+
+            self._commit_script_version(
+                project_id=project_id,
+                dirs=dirs,
+                script=revised_script,
+                report=rev_report,
+                event_type="fact_challenge",
+                event_content=f"Fact challenge: removed claim '{clean_cid}' from section '{target_section.id}'",
+                event_metadata={
+                    "action": "remove",
+                    "target_claim_id": clean_cid,
+                    "target_claim_text": target_claim.claim_text,
+                    "investigation_note": investigation_note,
+                    "prior_status": str(prior_status),
+                    "outcome": "removed_and_unlinked",
+                },
+            )
+
+            workflow_state = self._load_workflow_state(dirs["state_file"])
+            return {
+                "script": revised_script,
+                "workflow_state": workflow_state,
+                "fact_check_report": rev_report,
+                "challenge_summary": {
+                    "action": "remove",
+                    "target_claim_id": clean_cid,
+                    "target_claim_text": target_claim.claim_text,
+                    "section_id": target_section.id,
+                    "investigation_note": investigation_note,
+                    "outcome": "removed_and_unlinked",
+                    "prior_status": str(prior_status),
+                    "new_status": "unlinked",
+                    "explanation": f"Claim '{clean_cid}' was removed from section '{target_section.id}' narration and marked unlinked. Prior versions remain preserved.",
+                },
+            }
+
+        # 4. Handle Action: investigate
+        if action_clean == "investigate":
+            can_investigate = is_researched and (self.research_orchestrator is not None)
+            clean_user_inst = (instruction or "").strip()
+            if not clean_user_inst:
+                clean_user_inst = f"Verify factual validity of assertion: {target_claim.claim_text}"
+
+            if can_investigate:
+                # 4.1 Execute actual targeted re-investigation via ResearchOrchestrator
+                plan_id = f"rplan_inv_{uuid.uuid4().hex[:8]}"
+                inv_qid = f"qry_inv_{uuid.uuid4().hex[:6]}"
+                inv_query_text = clean_user_inst or f"Investigate: {target_claim.claim_text}"
+
+                target_plan = ResearchPlan(
+                    plan_id=plan_id,
+                    project_id=project_id,
+                    topic=f"Targeted Investigation: {clean_cid}",
+                    research_objective=f"Investigate factual validity of assertion: {target_claim.claim_text}",
+                    research_questions=[target_claim.claim_text],
+                    approved_tool_categories=["web_search", "web_extract"],
+                    budget_limits=ResearchBudgetConstraints(
+                        max_search_calls=1,
+                        max_extract_calls=1,
+                        deadline_seconds=30,
+                    ),
+                    planned_queries=[
+                        PlannedQuery(
+                            query_id=inv_qid,
+                            query_text=inv_query_text,
+                            purpose=f"Targeted investigation for claim {clean_cid}",
+                            target_question=target_claim.claim_text,
+                            tool_category="web_search",
+                        )
+                    ],
+                )
+                self.research_storage.save_plan(target_plan)
+
+                # Execute sequential bounded research run
+                new_run = self.research_orchestrator.execute_plan(project_id, target_plan.plan_id)
+                new_evidence_records = self.research_storage.list_evidence(project_id, run_id=new_run.run_id)
+
+                # Generate run-scoped brief
+                EvidenceBriefBuilder(storage_service=self.research_storage).build_and_save_brief(
+                    project_id, new_run.run_id
+                )
+
+                # Build combined catalog with new run as primary
+                new_catalog = self.generator._build_evidence_catalog(project_id, new_run)
+                if evidence_catalog:
+                    for eid, erec in evidence_catalog.evidence_by_id.items():
+                        if eid not in new_catalog.evidence_by_id:
+                            new_catalog.evidence_by_id[eid] = erec
+                    for sid, srec in evidence_catalog.sources_by_id.items():
+                        if sid not in new_catalog.sources_by_id:
+                            new_catalog.sources_by_id[sid] = srec
+
+                new_eids = [e.evidence_id for e in new_evidence_records]
+                new_excerpts = [f"- [{e.evidence_id}]: {e.excerpt}" for e in new_evidence_records]
+                challenge_directive = (
+                    f"[FACT CHALLENGE: Targeted Investigation for Claim {clean_cid}]\n"
+                    f"Target claim in section '{target_section.id}': '{target_claim.claim_text}'\n"
+                    f"Prior assessment status: {prior_status}\n"
+                    f"Freshly retrieved evidence from run '{new_run.run_id}':\n" + "\n".join(new_excerpts) + "\n"
+                    f"Permitted evidence IDs: {sorted(list(new_catalog.valid_evidence_ids))}\n"
+                    f"Challenge instruction: {clean_user_inst}\n"
+                    f"REQUIREMENT: Update section '{target_section.id}' to integrate the fresh evidence accurately while preserving all unaffected sentences and all other sections verbatim."
+                )
+
+                active_revised = self.revise_script(
+                    project_id=project_id,
+                    instruction=challenge_directive,
+                    override_research_run_id=new_run.run_id,
+                    override_catalog=new_catalog,
+                )
+
+                active_report = self.get_current_fact_check_report(project_id)
+
+                self._append_conversation_event(
+                    conversation_file=dirs["conversation_file"],
+                    event_type="fact_challenge",
+                    content=f"Fact challenge investigation executed for claim '{clean_cid}': {clean_user_inst}",
+                    script_version=active_revised.version,
+                    metadata={
+                        "action": "investigate",
+                        "target_claim_id": clean_cid,
+                        "target_claim_text": target_claim.claim_text,
+                        "prior_version": current_script.version,
+                        "new_version": active_revised.version,
+                        "prior_run_id": evidence_catalog.run_id if evidence_catalog else None,
+                        "new_run_id": new_run.run_id,
+                        "new_evidence_ids": new_eids,
+                        "investigation_performed": True,
+                    },
+                )
+
+                workflow_state = self._load_workflow_state(dirs["state_file"])
+                return {
+                    "script": active_revised,
+                    "workflow_state": workflow_state,
+                    "fact_check_report": active_report,
+                    "challenge_summary": {
+                        "action": "investigate",
+                        "target_claim_id": clean_cid,
+                        "target_claim_text": target_claim.claim_text,
+                        "section_id": target_section.id,
+                        "investigation_performed": True,
+                        "prior_run_id": evidence_catalog.run_id if evidence_catalog else None,
+                        "new_run_id": new_run.run_id,
+                        "new_evidence_ids": new_eids,
+                        "investigation_note": f"Targeted investigation completed via research run '{new_run.run_id}'. Retrieved {len(new_evidence_records)} fresh evidence record(s).",
+                        "outcome": "investigated_and_rechecked",
+                        "prior_status": str(prior_status),
+                        "new_version": active_revised.version,
+                        "explanation": f"Claim '{clean_cid}' was investigated with fresh research run '{new_run.run_id}'. Section '{target_section.id}' was revised to version {active_revised.version}.",
+                    },
+                }
+
+            else:
+                # 4.2 Fresh investigation is unavailable: recheck existing evidence or unresearched script
+                if not is_researched:
+                    investigation_note = "Investigation unavailable: Script was created in unresearched mode without external research grounding. Fresh research was NOT performed."
+                else:
+                    investigation_note = f"Fresh external investigation is currently unavailable (no active research tools configured). Claim was re-evaluated against existing evidence catalog for run '{evidence_catalog.run_id}'. Fresh research was NOT performed."
+
+                challenge_directive = (
+                    f"[FACT CHALLENGE: Claim {clean_cid}]\n"
+                    f"Target claim in section '{target_section.id}': '{target_claim.claim_text}'\n"
+                    f"Prior assessment status: {prior_status}\n"
+                    f"Existing evidence IDs: {target_claim.evidence_ids}\n"
+                    f"Challenge instruction: {clean_user_inst}\n"
+                    f"NOTE: {investigation_note}\n"
+                    f"REQUIREMENT: Revise section '{target_section.id}' to address this challenge accurately while preserving all unaffected sentences and all other sections verbatim."
+                )
+
+                active_revised = self.revise_script(
+                    project_id=project_id,
+                    instruction=challenge_directive,
+                )
+
+                active_report = self.get_current_fact_check_report(project_id)
+
+                self._append_conversation_event(
+                    conversation_file=dirs["conversation_file"],
+                    event_type="fact_challenge",
+                    content=f"Fact challenge executed for claim '{clean_cid}': {clean_user_inst}",
+                    script_version=active_revised.version,
+                    metadata={
+                        "action": "investigate",
+                        "target_claim_id": clean_cid,
+                        "target_claim_text": target_claim.claim_text,
+                        "prior_version": current_script.version,
+                        "new_version": active_revised.version,
+                        "prior_run_id": evidence_catalog.run_id if evidence_catalog else None,
+                        "new_run_id": None,
+                        "investigation_performed": False,
+                    },
+                )
+
+                workflow_state = self._load_workflow_state(dirs["state_file"])
+                return {
+                    "script": active_revised,
+                    "workflow_state": workflow_state,
+                    "fact_check_report": active_report,
+                    "challenge_summary": {
+                        "action": "investigate",
+                        "target_claim_id": clean_cid,
+                        "target_claim_text": target_claim.claim_text,
+                        "section_id": target_section.id,
+                        "investigation_performed": False,
+                        "prior_run_id": evidence_catalog.run_id if evidence_catalog else None,
+                        "new_run_id": None,
+                        "investigation_note": investigation_note,
+                        "outcome": "rechecked_existing_evidence_only" if is_researched else "unresearched_script_recheck",
+                        "prior_status": str(prior_status),
+                        "new_version": active_revised.version,
+                        "explanation": f"Claim '{clean_cid}' was re-evaluated against existing evidence. Fresh research was not performed.",
+                    },
+                }
+
+        # 5. Handle Action: qualify / rephrase
+        clean_user_inst = (instruction or "").strip()
+        if not clean_user_inst:
+            clean_user_inst = f"Re-evaluate and qualify claim '{clean_cid}' in section '{target_section.id}' for factual accuracy and evidence alignment."
+
+        challenge_directive = (
+            f"[FACT CHALLENGE: Claim {clean_cid}]\n"
+            f"Target claim in section '{target_section.id}': '{target_claim.claim_text}'\n"
+            f"Prior assessment status: {prior_status}\n"
+            f"Existing evidence IDs: {target_claim.evidence_ids}\n"
+            f"Challenge instruction: {clean_user_inst}\n"
+            f"REQUIREMENT: Revise section '{target_section.id}' to address this challenge accurately while preserving all unaffected sentences and all other sections verbatim."
+        )
+
+        active_revised = self.revise_script(
+            project_id=project_id,
+            instruction=challenge_directive,
+        )
+
+        active_report = self.get_current_fact_check_report(project_id)
+
+        self._append_conversation_event(
+            conversation_file=dirs["conversation_file"],
+            event_type="fact_challenge",
+            content=f"Fact challenge executed for claim '{clean_cid}': {clean_user_inst}",
+            script_version=active_revised.version,
+            metadata={
+                "action": action_clean,
+                "target_claim_id": clean_cid,
+                "target_claim_text": target_claim.claim_text,
+                "investigation_note": investigation_note,
+                "prior_status": str(prior_status),
+                "new_version": active_revised.version,
+            },
+        )
+
+        workflow_state = self._load_workflow_state(dirs["state_file"])
+        return {
+            "script": active_revised,
+            "workflow_state": workflow_state,
+            "fact_check_report": active_report,
+            "challenge_summary": {
+                "action": action_clean,
+                "target_claim_id": clean_cid,
+                "target_claim_text": target_claim.claim_text,
+                "section_id": target_section.id,
+                "investigation_note": investigation_note,
+                "outcome": "revised_and_rechecked",
+                "prior_status": str(prior_status),
+                "new_version": active_revised.version,
+                "explanation": f"Claim '{clean_cid}' was challenged and section '{target_section.id}' was revised to version {active_revised.version}.",
+            },
+        }
+

@@ -8,6 +8,15 @@ import uuid
 
 from backend.app.config import Settings, get_settings
 from backend.app.domain.contracts import ScenePlan, Script
+from backend.app.domain.fact_check import ScriptFactCheckReport
+from backend.app.domain.research import (
+    ChallengeClaimResponse,
+    QueryOutcomeView,
+    ResearchBriefResponse,
+    ResearchOverviewResponse,
+    SafeEvidenceView,
+    SafeSourceView,
+)
 from backend.app.domain.project import (
     ProjectMetadata,
     RunManifest,
@@ -21,6 +30,17 @@ from backend.app.services.project.service import (
     ProjectNotFoundError,
     ProjectService,
     ProjectValidationError,
+)
+from backend.app.services.research.orchestrator import ResearchOrchestrator
+from backend.app.services.research.storage import (
+    ResearchEvidenceNotFoundError,
+    ResearchPlanNotFoundError,
+    ResearchRunNotFoundError,
+    ResearchSecurityError,
+    ResearchSourceNotFoundError,
+    ResearchStorageError,
+    ResearchStorageService,
+    ResearchValidationError,
 )
 from backend.app.services.scriptwriter.service import (
     ScriptError,
@@ -88,15 +108,25 @@ class PipelineOrchestrator:
         self,
         project_service: Optional[ProjectService] = None,
         script_service: Optional[ScriptService] = None,
+        research_orchestrator: Optional[ResearchOrchestrator] = None,
         settings: Optional[Settings] = None,
         register_builtins: bool = False,
     ):
         self.settings = settings or get_settings()
         self.project_service = project_service or ProjectService(settings=self.settings)
-        self.script_service = script_service or ScriptService(
-            project_service=self.project_service,
+        self.research_storage = ResearchStorageService(
+            projects_root=self.project_service.projects_root,
             settings=self.settings,
         )
+        self.research_orchestrator = research_orchestrator
+        self.script_service = script_service or ScriptService(
+            project_service=self.project_service,
+            research_storage=self.research_storage,
+            research_orchestrator=self.research_orchestrator,
+            settings=self.settings,
+        )
+        if hasattr(self.script_service, "research_orchestrator") and self.script_service.research_orchestrator is None:
+            self.script_service.research_orchestrator = self.research_orchestrator
         self._stage_handlers: Dict[str, StageHandler] = {
             stage: default_unimplemented_handler(stage) for stage in STAGE_NAMES
         }
@@ -499,3 +529,239 @@ class PipelineOrchestrator:
         """Delegate retrieving script workflow state to the script service."""
         dirs = self.script_service._get_project_dirs(project_id)
         return self.script_service._load_workflow_state(dirs["state_file"])
+
+    def get_research_overview(self, project_id: str) -> ResearchOverviewResponse:
+        """Assemble structured, sanitized research overview for studio inspection."""
+        self.project_service.get_project(project_id)
+        runs = self.research_storage.list_runs(project_id)
+
+        if not runs:
+            return ResearchOverviewResponse(
+                project_id=project_id,
+                has_research=False,
+                active_run_id=None,
+                status=None,
+                termination_reason=None,
+                budget_summary={},
+                queries=[],
+                sources=[],
+                selected_evidence=[],
+                used_evidence_ids=[],
+                unused_evidence_ids=[],
+                conflicts=[],
+                unresolved_questions=[],
+            )
+
+        current_script: Optional[Script] = None
+        try:
+            current_script = self.get_script(project_id)
+        except Exception:
+            current_script = None
+
+        if current_script and current_script.research_run_id:
+            target_run_id = current_script.research_run_id
+        else:
+            target_run_id = runs[-1].run_id
+
+        active_run = self.research_storage.get_run(project_id, target_run_id)
+
+        # 1. Resolve research plan to discover unexecuted planned queries
+        plan = None
+        try:
+            plan = self.research_storage.get_plan(project_id, active_run.plan_id)
+        except Exception:
+            plan = None
+
+        queries: List[QueryOutcomeView] = []
+        executed_qids: Set[str] = set()
+        for q in active_run.query_records:
+            executed_qids.add(q.query_id)
+            status_clean = "completed" if q.status == "succeeded" else q.status
+            skip_reason = q.error_message if q.status == "skipped" else None
+            queries.append(
+                QueryOutcomeView(
+                    query_id=q.query_id,
+                    query_text=q.query_text,
+                    intended_question=q.intended_question,
+                    status=status_clean,
+                    result_count=q.result_count,
+                    error_message=q.error_message if q.status != "skipped" else None,
+                    skip_reason=skip_reason,
+                    returned_source_ids=q.returned_source_ids,
+                )
+            )
+
+        if plan:
+            for pq in plan.planned_queries:
+                if pq.query_id not in executed_qids:
+                    queries.append(
+                        QueryOutcomeView(
+                            query_id=pq.query_id,
+                            query_text=pq.query_text,
+                            intended_question=pq.target_question or pq.purpose,
+                            status="planned",
+                            result_count=0,
+                            error_message=None,
+                            skip_reason=None,
+                            returned_source_ids=[],
+                        )
+                    )
+
+        # 2. Sanitized Sources View
+        sources_raw = self.research_storage.list_sources(project_id)
+        sources = [
+            SafeSourceView(
+                source_id=s.source_id,
+                url=s.url,
+                title=s.title,
+                publisher=s.publisher,
+                retrieval_status=s.retrieval_status,
+                retrieved_at=s.retrieved_at,
+                publication_date=s.publication_date,
+                char_count=s.char_count,
+            )
+            for s in sources_raw
+            if s.url.startswith("http://") or s.url.startswith("https://")
+        ]
+
+        # 3. Evidence Distinctions: Retrieved, Candidate, AI-Selected, Active Script Used vs Unused
+        evidence_raw = self.research_storage.list_evidence(project_id, run_id=active_run.run_id)
+        section_claim_ids = {cid for s in current_script.sections for cid in getattr(s, "claim_ids", [])} if current_script else set()
+        active_claims = [
+            c for c in (current_script.claims if current_script else [])
+            if not section_claim_ids or c.claim_id in section_claim_ids
+        ]
+        used_eids = set(eid for c in active_claims for eid in c.evidence_ids)
+
+        # AI-Selected evidence identification: from outline section citations or recorded selection operation
+        # Note: Candidate status indicates availability for consideration, not automatic selection.
+        outline = getattr(current_script, "outline", None) if current_script else None
+        if not outline:
+            try:
+                dirs = self.script_service._get_project_dirs(project_id)
+                outline_files = sorted(dirs["outlines_dir"].glob("*.json"))
+                if outline_files:
+                    outline_data = json.loads(outline_files[-1].read_text(encoding="utf-8"))
+                    outline = ScriptOutline.model_validate(outline_data)
+            except Exception:
+                outline = None
+        selected_by_outline_ids = set(eid for s in outline.sections for eid in s.evidence_ids) if outline else set()
+        selected_ids_from_run = set()
+        if isinstance(active_run.artifacts.get("selected_evidence_ids"), list):
+            selected_ids_from_run = set(active_run.artifacts["selected_evidence_ids"])
+        recorded_selected_ids = selected_by_outline_ids | selected_ids_from_run
+
+        selected_evidence = []
+        for e in evidence_raw:
+            is_used = e.evidence_id in used_eids
+            used_by = [c.claim_id for c in active_claims if e.evidence_id in c.evidence_ids]
+            is_selected = e.evidence_id in recorded_selected_ids
+            selection_rationale = getattr(e, "selection_rationale", None)
+            selected_evidence.append(
+                SafeEvidenceView(
+                    evidence_id=e.evidence_id,
+                    source_id=e.source_id,
+                    query_id=e.query_id,
+                    run_id=e.run_id,
+                    excerpt=e.excerpt,
+                    locator=e.locator,
+                    target_claim=e.target_claim,
+                    status=e.status,
+                    is_selected=is_selected,
+                    selection_rationale=selection_rationale,
+                    is_used_in_current_script=is_used,
+                    used_by_claims=used_by,
+                )
+            )
+
+        retrieved_evidence_ids = sorted([e.evidence_id for e in evidence_raw])
+        selected_evidence_ids = sorted([e.evidence_id for e in evidence_raw if e.evidence_id in recorded_selected_ids])
+        used_evidence_ids = sorted(list(used_eids))
+        unused_evidence_ids = sorted([e.evidence_id for e in evidence_raw if e.evidence_id not in used_eids])
+
+        unresolved = []
+        for q in active_run.query_records:
+            if q.status == "skipped":
+                unresolved.append(f"Skipped query: '{q.query_text}' ({q.error_message or 'Budget ceiling'})")
+            elif q.status == "failed":
+                unresolved.append(f"Failed query: '{q.query_text}' ({q.error_message or 'Provider error'})")
+
+        conflicts = []
+        try:
+            report = self.script_service.get_current_fact_check_report(project_id)
+            if report:
+                for a in report.assessments:
+                    if a.status == "conflicting":
+                        conflicts.append(f"Claim '{a.claim_id}' has conflicting evidence: {a.explanation}")
+                    elif a.status == "contradicted":
+                        conflicts.append(f"Claim '{a.claim_id}' contradicted by evidence: {a.explanation}")
+        except Exception:
+            pass
+
+        budget_summary = {
+            "search_calls_used": active_run.search_calls_used,
+            "extract_calls_used": active_run.extract_calls_used,
+            "total_chars_extracted": active_run.total_chars_extracted,
+            "max_search_calls": active_run.budget_limits.max_search_calls,
+            "max_extract_calls": active_run.budget_limits.max_extract_calls,
+        }
+
+        return ResearchOverviewResponse(
+            project_id=project_id,
+            has_research=True,
+            active_run_id=active_run.run_id,
+            status=active_run.status,
+            termination_reason=active_run.termination_reason,
+            budget_summary=budget_summary,
+            queries=queries,
+            sources=sources,
+            selected_evidence=selected_evidence,
+            retrieved_evidence_ids=retrieved_evidence_ids,
+            selected_evidence_ids=selected_evidence_ids,
+            used_evidence_ids=used_evidence_ids,
+            unused_evidence_ids=unused_evidence_ids,
+            conflicts=conflicts,
+            unresolved_questions=unresolved,
+        )
+
+    def get_evidence_brief(self, project_id: str, run_id: Optional[str] = None) -> Optional[str]:
+        """Retrieve evidence brief markdown content for a project or specific run."""
+        self.project_service.get_project(project_id)
+        if run_id:
+            return self.research_storage.get_run_evidence_brief(project_id, run_id)
+        try:
+            curr = self.get_script(project_id)
+            if curr and curr.research_run_id:
+                content = self.research_storage.get_run_evidence_brief(project_id, curr.research_run_id)
+                if content:
+                    return content
+        except Exception:
+            pass
+        return self.research_storage.get_evidence_brief(project_id)
+
+    def get_fact_check_report(self, project_id: str, version: Optional[int] = None) -> Optional[ScriptFactCheckReport]:
+        """Retrieve active or versioned fact-check report."""
+        if version is not None:
+            return self.script_service.get_fact_check_report(project_id, version)
+        return self.script_service.get_current_fact_check_report(project_id)
+
+    def challenge_claim(
+        self,
+        project_id: str,
+        claim_id: str,
+        instruction: Optional[str] = None,
+        action: Optional[str] = "investigate",
+    ) -> ChallengeClaimResponse:
+        """Execute a conversational fact challenge via ScriptService and return structured response."""
+        raw_result = self.script_service.challenge_claim(
+            project_id=project_id,
+            claim_id=claim_id,
+            instruction=instruction,
+            action=action,
+        )
+        return ChallengeClaimResponse(
+            script=raw_result["script"].model_dump() if hasattr(raw_result["script"], "model_dump") else raw_result["script"],
+            workflow_state=raw_result["workflow_state"],
+            fact_check_report=raw_result["fact_check_report"].model_dump() if hasattr(raw_result.get("fact_check_report"), "model_dump") else raw_result.get("fact_check_report"),
+            challenge_summary=raw_result.get("challenge_summary", {}),
+        )

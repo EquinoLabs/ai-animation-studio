@@ -6,11 +6,25 @@ from pydantic import BaseModel, Field
 
 from backend.app.config import Settings, get_settings
 from backend.app.domain.contracts import Script
+from backend.app.domain.fact_check import ScriptFactCheckReport
 from backend.app.domain.project import ProjectMetadata
+from backend.app.domain.research import (
+    ChallengeClaimRequest,
+    ChallengeClaimResponse,
+    ResearchBriefResponse,
+    ResearchOverviewResponse,
+)
 from backend.app.domain.script import ConversationEvent
 from backend.app.services.pipeline.orchestrator import (
     PipelineError,
     PipelineOrchestrator,
+    ResearchEvidenceNotFoundError,
+    ResearchPlanNotFoundError,
+    ResearchRunNotFoundError,
+    ResearchSecurityError,
+    ResearchSourceNotFoundError,
+    ResearchStorageError,
+    ResearchValidationError,
     ScriptError,
     ScriptFinalizationError,
     ScriptNotFoundError,
@@ -76,15 +90,17 @@ class ScriptStateResponse(BaseModel):
 
 def _handle_service_errors(exc: Exception) -> None:
     """Map domain exceptions to standard HTTP status codes."""
-    if isinstance(exc, (ProjectNotFoundError, ScriptNotFoundError)):
+    if isinstance(exc, HTTPException):
+        raise exc
+    if isinstance(exc, (ProjectNotFoundError, ScriptNotFoundError, ResearchRunNotFoundError, ResearchSourceNotFoundError, ResearchEvidenceNotFoundError)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
-    if isinstance(exc, ProjectSecurityError):
+    if isinstance(exc, (ProjectSecurityError, ResearchSecurityError)):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    if isinstance(exc, (ScriptValidationError, ProjectValidationError)):
+    if isinstance(exc, (ScriptValidationError, ProjectValidationError, ResearchValidationError)):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
     if isinstance(exc, ScriptFinalizationError):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    if isinstance(exc, ScriptStorageError):
+    if isinstance(exc, (ScriptStorageError, ResearchStorageError)):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
     if "unavailable" in str(exc).lower() or "connection" in str(exc).lower():
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
@@ -297,3 +313,85 @@ def list_finalized_versions(
     except Exception as exc:
         _handle_service_errors(exc)
         raise
+
+
+# ------------------------------------------------------------------------------
+# Research Studio Endpoints (Phase 6)
+# ------------------------------------------------------------------------------
+
+@router.get("/projects/{project_id}/research", response_model=ResearchOverviewResponse)
+def get_research_overview(
+    project_id: str,
+    orchestrator: PipelineOrchestrator = Depends(get_orchestrator),
+) -> ResearchOverviewResponse:
+    """Retrieve structured research overview including query outcomes, sources, and used/unused evidence."""
+    try:
+        return orchestrator.get_research_overview(project_id)
+    except Exception as exc:
+        _handle_service_errors(exc)
+        raise
+
+
+@router.get("/projects/{project_id}/research/brief", response_model=ResearchBriefResponse)
+def get_evidence_brief(
+    project_id: str,
+    run_id: Optional[str] = None,
+    orchestrator: PipelineOrchestrator = Depends(get_orchestrator),
+) -> ResearchBriefResponse:
+    """Retrieve persisted evidence brief markdown content for studio display."""
+    try:
+        brief_text = orchestrator.get_evidence_brief(project_id, run_id=run_id)
+        if not brief_text:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No evidence brief found for project '{project_id}'.",
+            )
+        return ResearchBriefResponse(
+            project_id=project_id,
+            run_id=run_id,
+            brief_markdown=brief_text,
+        )
+    except Exception as exc:
+        _handle_service_errors(exc)
+        raise
+
+
+# ------------------------------------------------------------------------------
+# Fact-Checking & Conversational Challenge Endpoints (Phase 6)
+# ------------------------------------------------------------------------------
+
+@router.get("/projects/{project_id}/script/fact-check", response_model=ScriptFactCheckReport)
+def get_fact_check_report(
+    project_id: str,
+    version: Optional[int] = None,
+    orchestrator: PipelineOrchestrator = Depends(get_orchestrator),
+) -> ScriptFactCheckReport:
+    """Retrieve the active or version-specific fact-check report."""
+    try:
+        report = orchestrator.get_fact_check_report(project_id, version=version)
+        if report is None:
+            raise ScriptNotFoundError(f"No fact-check report found for project '{project_id}'.")
+        return report
+    except Exception as exc:
+        _handle_service_errors(exc)
+        raise
+
+
+@router.post("/projects/{project_id}/script/challenge", response_model=ChallengeClaimResponse)
+def challenge_claim(
+    project_id: str,
+    req: ChallengeClaimRequest,
+    orchestrator: PipelineOrchestrator = Depends(get_orchestrator),
+) -> ChallengeClaimResponse:
+    """Execute a conversational fact challenge against a specific factual claim."""
+    try:
+        return orchestrator.challenge_claim(
+            project_id=project_id,
+            claim_id=req.claim_id,
+            instruction=req.instruction,
+            action=req.action,
+        )
+    except Exception as exc:
+        _handle_service_errors(exc)
+        raise
+

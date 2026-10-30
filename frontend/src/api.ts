@@ -7,6 +7,9 @@ import {
   Script,
   ScriptStateResponse,
   ConversationEvent,
+  ResearchOverviewResponse,
+  ResearchBriefResponse,
+  ScriptFactCheckReport,
 } from './types';
 
 const API_BASE = '/api/v1';
@@ -140,5 +143,23 @@ export const api = {
   getFinalizedVersions: async (projectId: string): Promise<Script[]> => {
     const res = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/script/finalized`);
     return handleResponse<Script[]>(res);
+  },
+
+  // Research Studio & Fact-Checking (Phase 6 Checkpoint 1 & 2)
+  getResearchOverview: async (projectId: string): Promise<ResearchOverviewResponse> => {
+    const res = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/research`);
+    return handleResponse<ResearchOverviewResponse>(res);
+  },
+
+  getResearchBrief: async (projectId: string, runId?: string): Promise<ResearchBriefResponse> => {
+    const query = runId ? `?run_id=${encodeURIComponent(runId)}` : '';
+    const res = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/research/brief${query}`);
+    return handleResponse<ResearchBriefResponse>(res);
+  },
+
+  getFactCheckReport: async (projectId: string, version?: number): Promise<ScriptFactCheckReport> => {
+    const query = version !== undefined ? `?version=${encodeURIComponent(version)}` : '';
+    const res = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/script/fact-check${query}`);
+    return handleResponse<ScriptFactCheckReport>(res);
   },
 };

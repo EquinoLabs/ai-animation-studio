@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Literal, Optional
 import uuid
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from backend.app.domain.fact_check import ClaimAssessmentStatus, ClaimRiskLevel
+
 
 def utc_now() -> datetime:
     """Return timezone-aware current UTC datetime."""
@@ -115,6 +117,14 @@ class ScriptClaim(BaseModel):
     link_status: ClaimLinkStatus = Field(
         default="unlinked",
         description="Reference declaration status ('linked' if evidence references are declared/supplied, 'unlinked' otherwise). Does NOT imply that records exist in storage or that the claim is verified.",
+    )
+    assessment_status: Optional[ClaimAssessmentStatus] = Field(
+        default=None,
+        description="Optional substantive Phase 5 assessment status ('supported', 'partially_supported', 'conflicting', 'unsupported', 'not_checked', 'contradicted'). Kept distinct from link_status.",
+    )
+    risk_level: Optional[ClaimRiskLevel] = Field(
+        default="normal",
+        description="Optional risk tier for fact-checking scrutiny ('high', 'normal', 'creative_flexibility').",
     )
 
     @field_validator("claim_id")
@@ -564,6 +574,7 @@ ConversationEventType = Literal[
     "draft_accepted",
     "draft_rejected",
     "script_finalized",
+    "fact_challenge",
 ]
 
 

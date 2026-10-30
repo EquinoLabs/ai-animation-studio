@@ -53,6 +53,7 @@ from backend.app.services.research.storage import (
     ResearchStorageService,
     ResearchValidationError,
 )
+from backend.app.services.scriptwriter.classifier import classify_claim_risk
 from backend.app.services.scriptwriter.outliner import ValidatedEvidenceCatalog
 from backend.app.services.scriptwriter.policy import (
     ScriptPromptBuilder,
@@ -501,12 +502,18 @@ class ScriptDraftGenerator:
                 if eid in evidence_catalog.evidence_by_id
             ))
 
+            risk_level = classify_claim_risk(
+                claim_payload.claim_text.strip(),
+                section_type=target_sec_id,
+            )
+
             claim = ScriptClaim(
                 claim_id=canonical_claim_id,
                 claim_text=claim_payload.claim_text.strip(),
                 section_id=target_sec_id,
                 evidence_ids=valid_evidence_ids,
                 source_ids=derived_source_ids,
+                risk_level=risk_level,
                 link_status="linked" if valid_evidence_ids else "unlinked",
             )
             domain_claims.append(claim)

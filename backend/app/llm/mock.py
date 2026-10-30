@@ -1,10 +1,16 @@
 """Deterministic, offline mock LLM provider for testing and local development."""
 
 import copy
+import re
 from typing import Any, Dict, List, Optional, Type, TypeVar
 import uuid
 
 from pydantic import BaseModel
+
+from backend.app.domain.fact_check import (
+    BatchFactCheckResponsePayload,
+    ClaimAssessmentPayload,
+)
 
 from backend.app.domain.research import (
     GeneratedPlanPayload,
@@ -75,7 +81,7 @@ class MockLLMProvider(LLMProvider):
 
     def generate_json(self, prompt: str, schema: Type[T]) -> T:
         """Generate structured output adhering to schema."""
-        self.calls.append({"prompt": prompt, "schema": schema.__name__})
+        self.calls.append({"action": "generate_json", "prompt": prompt, "schema": schema.__name__})
 
         # 1. Check response queue first
         if self._response_queue:
@@ -233,7 +239,6 @@ class MockLLMProvider(LLMProvider):
         # 7. Fallback deterministic generator for script draft payloads
         if schema is GeneratedScriptPayload or schema.__name__ == "GeneratedScriptPayload":
             # Extract evidence IDs if present in prompt
-            import re
             evidence_ids = []
             ev_matches = re.findall(r"\b(evi_[a-zA-Z0-9_-]+)\b", prompt)
             if ev_matches:
@@ -322,6 +327,114 @@ class MockLLMProvider(LLMProvider):
                 sections=sections,
                 claims=claims,
             )
+
+        # 8. Fallback deterministic generator for fact-check batch payloads
+        if schema is BatchFactCheckResponsePayload or schema.__name__ == "BatchFactCheckResponsePayload":
+            claim_blocks = re.findall(
+                r"CLAIM ID:\s*([a-zA-Z0-9_-]+).*?(?:PROPOSITION:\s*\"(.*?)\").*?(?:RISK LEVEL:\s*(\w+)).*?PERMITTED EVIDENCE:\s*(.*?)(?=\n--- CLAIM|\n=== END BATCH|\Z)",
+                prompt,
+                re.DOTALL,
+            )
+            assessments = []
+            for cid, prop, risk, ev_text in claim_blocks:
+                eids = re.findall(r"- ID:\s*([a-zA-Z0-9_-]+)", ev_text)
+                is_creative = (risk == "creative_flexibility")
+                status = "supported" if (eids or is_creative) else "unsupported"
+                action = "keep" if (eids or is_creative) else "qualify"
+                assessments.append(
+                    ClaimAssessmentPayload(
+                        claim_id=cid,
+                        status=status,
+                        explanation=f"Mock assessment: proposition is {status}.",
+                        supporting_evidence_ids=eids[:1] if (eids and status == "supported") else [],
+                        contradicting_evidence_ids=[],
+                        contextual_evidence_ids=[],
+                        recommended_action=action,
+                    )
+                )
+            return schema(assessments=assessments)
+
+        # 9. Fallback deterministic generator for section repair payloads
+        if schema.__name__ == "SectionRepairPayload":
+            sec_match = re.search(r"SECTION ID:\s*([a-zA-Z0-9_-]+)", prompt)
+            sec_id = sec_match.group(1) if sec_match else "sec_01"
+
+            narration_match = re.search(r'CURRENT SECTION NARRATION:\s*"(.*?)"', prompt, re.DOTALL)
+            cur_narration = narration_match.group(1) if narration_match else "Repaired narration."
+
+            claim_blocks = re.findall(
+                r"CLAIM ID:\s*([a-zA-Z0-9_-]+).*?(?:CURRENT PROPOSITION:\s*\"(.*?)\").*?(?:FACT-CHECK STATUS:\s*(\w+)).*?PERMITTED EVIDENCE FOR REPAIR:\s*(.*?)(?=\n--- CLAIM|\n=== END REQUEST|\Z)",
+                prompt,
+                re.DOTALL,
+            )
+            repairs_list = []
+            used_spans = set()
+            for cid, prop, status, ev_text in claim_blocks:
+                eids = re.findall(r"- ID:\s*([a-zA-Z0-9_-]+)", ev_text)
+                if status == "partially_supported":
+                    action = "qualify"
+                    rev_text = f"{prop.rstrip('.')} under verified conditions."
+                    chosen_eids = eids[:1] if eids else []
+                elif status == "contradicted":
+                    if eids:
+                        action = "rephrase"
+                        rev_text = f"Alternative verified fact: {prop.rstrip('.')} corrected."
+                        chosen_eids = eids[:1]
+                    else:
+                        action = "remove"
+                        rev_text = None
+                        chosen_eids = []
+                elif status == "unsupported":
+                    if eids:
+                        action = "rephrase"
+                        rev_text = f"Supported correction: {prop.rstrip('.')}."
+                        chosen_eids = eids[:1]
+                    else:
+                        action = "remove"
+                        rev_text = None
+                        chosen_eids = []
+                else:
+                    action = "keep"
+                    rev_text = prop
+                    chosen_eids = eids[:1] if eids else []
+
+                target_span = prop if (prop and cur_narration.count(prop) == 1 and prop not in used_spans) else None
+                if not target_span:
+                    # Find a sentence in cur_narration that appears once and hasn't been used yet
+                    sentences = [s.strip() for s in cur_narration.split(".") if s.strip()]
+                    for s in sentences:
+                        full_s = s + "." if (s + ".") in cur_narration else s
+                        if cur_narration.count(full_s) == 1 and full_s not in used_spans:
+                            target_span = full_s
+                            break
+                    if not target_span and cur_narration.strip() and cur_narration.strip() not in used_spans:
+                        target_span = cur_narration.strip()
+
+                if target_span:
+                    used_spans.add(target_span)
+
+                if action in ("qualify", "rephrase"):
+                    replacement_span = rev_text if (rev_text and rev_text.strip()) else "Verified replacement statement."
+                else:
+                    replacement_span = None
+
+                repairs_list.append(
+                    {
+                        "claim_id": cid,
+                        "action": action,
+                        "target_span": target_span,
+                        "replacement_span": replacement_span,
+                        "revised_claim_text": rev_text,
+                        "evidence_ids": chosen_eids,
+                        "explanation": f"Deterministic mock repair for {cid} ({action}).",
+                    }
+                )
+
+            return schema.model_validate({
+                "section_id": sec_id,
+                "revised_narration": cur_narration,
+                "repairs": repairs_list,
+            })
 
         raise NotImplementedError("Direct generate_json on MockLLMProvider requires preset response or use generate_script/revise_script.")
 
@@ -575,6 +688,18 @@ class MockLLMProvider(LLMProvider):
             new_title = f"{current_script.title} (Revised)"
 
         cloned_claims = [c.model_copy() for c in current_script.claims]
+
+        # Deterministic targeted fact challenge investigation handling
+        chal_match = re.search(r"FACT CHALLENGE:.*?Claim ([a-zA-Z0-9_]+)", instruction)
+        if chal_match:
+            target_cid = chal_match.group(1)
+            new_eids = re.findall(r"evi_[a-zA-Z0-9_]+", instruction)
+            for c in cloned_claims:
+                if c.claim_id == target_cid:
+                    if new_eids:
+                        c.evidence_ids = list(dict.fromkeys(new_eids))
+                        c.link_status = "linked"
+                    c.claim_text = f"{c.claim_text} (Investigated & Grounded)"
 
         revised = Script(
             script_id=current_script.script_id,

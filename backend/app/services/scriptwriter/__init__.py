@@ -1,5 +1,15 @@
 """Scriptwriting, outline management, and writing policy layer."""
 
+from backend.app.services.scriptwriter.classifier import classify_claim_risk
+from backend.app.services.scriptwriter.fact_checker import (
+    BatchFactCheckResponsePayload,
+    ClaimAssessmentPayload,
+    ScriptFactChecker,
+    ScriptFactCheckError,
+    ScriptFactCheckMalformedError,
+    ScriptFactCheckSecurityError,
+    ScriptFactCheckUnavailableError,
+)
 from backend.app.services.scriptwriter.generator import (
     DraftGeneratorInput,
     ScriptDraftEvidenceValidationError,
@@ -35,6 +45,17 @@ from backend.app.services.scriptwriter.policy import (
     get_structure_guidance,
     get_tone_guidance,
 )
+from backend.app.services.scriptwriter.repairer import (
+    ClaimRepairActionRecord,
+    ClaimRepairPayload,
+    ScriptRepairError,
+    ScriptRepairMalformedError,
+    ScriptRepairSecurityError,
+    ScriptRepairUnavailableError,
+    ScriptRepairResult,
+    ScriptRepairer,
+    SectionRepairPayload,
+)
 from backend.app.services.scriptwriter.service import (
     ScriptError,
     ScriptFinalizationError,
@@ -46,6 +67,11 @@ from backend.app.services.scriptwriter.service import (
 
 __all__ = [
     "ANTI_FILLER_DIRECTIVES",
+    "BatchFactCheckResponsePayload",
+    "ClaimAssessmentPayload",
+    "ClaimRepairActionRecord",
+    "ClaimRepairPayload",
+    "classify_claim_risk",
     "DraftGeneratorInput",
     "HOOK_FORMULAS",
     "HookFormula",
@@ -62,6 +88,11 @@ __all__ = [
     "ScriptDraftSecurityError",
     "ScriptDraftUnavailableError",
     "ScriptError",
+    "ScriptFactCheckError",
+    "ScriptFactCheckMalformedError",
+    "ScriptFactCheckSecurityError",
+    "ScriptFactCheckUnavailableError",
+    "ScriptFactChecker",
     "ScriptFinalizationError",
     "ScriptNotFoundError",
     "ScriptOutliner",
@@ -71,10 +102,17 @@ __all__ = [
     "ScriptOutlinerSecurityError",
     "ScriptOutlinerUnavailableError",
     "ScriptPromptBuilder",
+    "ScriptRepairError",
+    "ScriptRepairMalformedError",
+    "ScriptRepairResult",
+    "ScriptRepairSecurityError",
+    "ScriptRepairUnavailableError",
+    "ScriptRepairer",
     "ScriptService",
     "ScriptStorageError",
     "ScriptTone",
     "ScriptValidationError",
+    "SectionRepairPayload",
     "WritingPolicy",
     "detect_narrative_structure",
     "get_hook_formula_guidance",

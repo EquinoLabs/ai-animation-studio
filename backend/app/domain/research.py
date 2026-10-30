@@ -100,6 +100,7 @@ class ResearchPlan(BaseModel):
             )
         return v
 
+
     @field_validator("research_questions")
     @classmethod
     def validate_questions(cls, v: List[str]) -> List[str]:
@@ -298,6 +299,10 @@ class EvidenceRecord(BaseModel):
     locator: Optional[str] = Field(default=None, description="Section, heading, or paragraph locator.")
     target_claim: Optional[str] = Field(default=None, description="Research question or claim addressed.")
     status: EvidenceStatus = "retrieved"
+    selection_rationale: Optional[str] = Field(
+        default=None,
+        description="Optional rationale explaining why this evidence excerpt was selected as candidate."
+    )
     created_at: datetime = Field(default_factory=utc_now)
 
     @field_validator("evidence_id", "project_id", "source_id")
@@ -346,3 +351,110 @@ class ResearchRun(BaseModel):
                 f"Unsupported schema_version '{v}'. Supported versions: {sorted(SUPPORTED_SCHEMA_VERSIONS)}"
             )
         return v
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Research Studio Inspection & Conversational Challenge Contracts
+# ---------------------------------------------------------------------------
+
+class SafeSourceView(BaseModel):
+    """Sanitized, safe view of a source record for frontend inspection."""
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: str
+    url: str
+    title: Optional[str] = None
+    publisher: Optional[str] = None
+    retrieval_status: str
+    retrieved_at: Optional[datetime] = None
+    publication_date: Optional[str] = None
+    char_count: int = 0
+
+
+class SafeEvidenceView(BaseModel):
+    """Sanitized view of an evidence record with active script usage tracking."""
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_id: str
+    source_id: str
+    query_id: Optional[str] = None
+    run_id: Optional[str] = None
+    excerpt: str
+    locator: Optional[str] = None
+    target_claim: Optional[str] = None
+    status: str
+    is_selected: bool = False
+    selection_rationale: Optional[str] = None
+    is_used_in_current_script: bool = False
+    used_by_claims: List[str] = Field(default_factory=list)
+
+
+class QueryOutcomeView(BaseModel):
+    """Sanitized view of a research query execution outcome."""
+    model_config = ConfigDict(extra="forbid")
+
+    query_id: str
+    query_text: str
+    intended_question: Optional[str] = None
+    status: str
+    result_count: int = 0
+    error_message: Optional[str] = None
+    skip_reason: Optional[str] = None
+    returned_source_ids: List[str] = Field(default_factory=list)
+
+
+class ResearchOverviewResponse(BaseModel):
+    """Comprehensive research overview for the Research & Facts Studio panel."""
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    has_research: bool = False
+    active_run_id: Optional[str] = None
+    status: Optional[str] = None
+    termination_reason: Optional[str] = None
+    budget_summary: Dict[str, Any] = Field(default_factory=dict)
+    queries: List[QueryOutcomeView] = Field(default_factory=list)
+    sources: List[SafeSourceView] = Field(default_factory=list)
+    selected_evidence: List[SafeEvidenceView] = Field(default_factory=list)
+    retrieved_evidence_ids: List[str] = Field(default_factory=list)
+    selected_evidence_ids: List[str] = Field(default_factory=list)
+    used_evidence_ids: List[str] = Field(default_factory=list)
+    unused_evidence_ids: List[str] = Field(default_factory=list)
+    conflicts: List[str] = Field(default_factory=list)
+    unresolved_questions: List[str] = Field(default_factory=list)
+    disclaimer: str = (
+        "Research and evidence records are provided for creator inspection and verification. "
+        "AI-assisted retrieval improves reliability but does not guarantee absolute factual truth."
+    )
+
+
+class ResearchBriefResponse(BaseModel):
+    """Evidence brief response for markdown display."""
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    run_id: Optional[str] = None
+    brief_markdown: str
+
+
+class ChallengeClaimRequest(BaseModel):
+    """Request payload for conversational claim challenge."""
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: str = Field(..., min_length=1, max_length=50, description="Target claim ID to challenge (e.g. clm_01)")
+    instruction: Optional[str] = Field(default=None, max_length=2000, description="Conversational challenge instruction or objection")
+    action: Optional[Literal["investigate", "remove", "qualify", "rephrase"]] = Field(
+        default="investigate",
+        description="Target challenge action: investigate, remove, qualify, or rephrase"
+    )
+
+
+class ChallengeClaimResponse(BaseModel):
+    """Response payload returned upon executing a claim challenge."""
+    model_config = ConfigDict(extra="forbid")
+
+    script: Dict[str, Any] = Field(description="Updated script dictionary or model")
+    workflow_state: Dict[str, Any] = Field(default_factory=dict)
+    fact_check_report: Optional[Dict[str, Any]] = None
+    challenge_summary: Dict[str, Any] = Field(default_factory=dict)
+

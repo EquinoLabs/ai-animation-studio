@@ -4,6 +4,7 @@ import { api, ApiError } from './api';
 import { ProjectMetadata, Script, WorkflowState, ConversationEvent } from './types';
 import { ProjectBar } from './components/ProjectBar';
 import { ScriptViewer } from './components/ScriptViewer';
+import { ResearchStudioPanel } from './components/ResearchStudioPanel';
 import { ChatPanel } from './components/ChatPanel';
 import { FinalizeModal } from './components/FinalizeModal';
 import { RejectModal } from './components/RejectModal';
@@ -30,6 +31,9 @@ export const App: React.FC = () => {
   const [showFinalizeModal, setShowFinalizeModal] = useState<boolean>(false);
   const [showRejectModal, setShowRejectModal] = useState<boolean>(false);
   const [showVersionsModal, setShowVersionsModal] = useState<boolean>(false);
+
+  // Active workspace view: Script editor or Research Studio (Phase 6 Checkpoint 2)
+  const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<'script' | 'research'>('script');
 
   // Check server health periodically
   useEffect(() => {
@@ -232,21 +236,55 @@ export const App: React.FC = () => {
         </div>
       )}
 
+      {/* Workspace Tabs Navigation Bar (Phase 6 Checkpoint 2) */}
+      {currentProjectId && (
+        <div className="workspace-tabs-bar">
+          <nav className="workspace-nav" aria-label="Studio Workspace Navigation">
+            <button
+              type="button"
+              className={`workspace-tab-btn ${activeWorkspaceTab === 'script' ? 'active' : ''}`}
+              onClick={() => setActiveWorkspaceTab('script')}
+            >
+              📝 Script Workspace
+              {script && (
+                <span className="tab-pill">
+                  v{script.version} ({script.status})
+                </span>
+              )}
+            </button>
+            <button
+              type="button"
+              className={`workspace-tab-btn ${activeWorkspaceTab === 'research' ? 'active' : ''}`}
+              onClick={() => setActiveWorkspaceTab('research')}
+            >
+              🔬 Research Studio
+            </button>
+          </nav>
+        </div>
+      )}
+
       {/* Main Studio Workspace */}
       <div className="main-content">
-        {/* Left Column: Script Viewer */}
+        {/* Left Column: Script Viewer or Research Studio */}
         <section className="script-column">
           {currentProjectId ? (
-            <ScriptViewer
-              script={script}
-              workflowState={workflowState}
-              loading={loading}
-              onStartScript={handleStartScript}
-              onAcceptDraft={handleAcceptDraft}
-              onOpenRejectModal={() => setShowRejectModal(true)}
-              onOpenFinalizeModal={() => setShowFinalizeModal(true)}
-              onOpenVersionsModal={() => setShowVersionsModal(true)}
-            />
+            activeWorkspaceTab === 'script' ? (
+              <ScriptViewer
+                script={script}
+                workflowState={workflowState}
+                loading={loading}
+                onStartScript={handleStartScript}
+                onAcceptDraft={handleAcceptDraft}
+                onOpenRejectModal={() => setShowRejectModal(true)}
+                onOpenFinalizeModal={() => setShowFinalizeModal(true)}
+                onOpenVersionsModal={() => setShowVersionsModal(true)}
+              />
+            ) : (
+              <ResearchStudioPanel
+                projectId={currentProjectId}
+                currentScriptVersion={script?.version}
+              />
+            )
           ) : (
             <div style={{ textAlign: 'center', margin: '4rem auto', maxWidth: '420px', color: 'var(--text-secondary)' }}>
               <div style={{ fontSize: '2.5rem', marginBottom: '1rem' }}>📂</div>
