@@ -392,7 +392,9 @@ class ScriptRepairer:
         repaired_script.sections = repaired_sections
         repaired_script.claims = repaired_claims
         repaired_script = populate_script_duration_metrics(
-            repaired_script, words_per_minute=getattr(self.llm_provider, "words_per_minute", 140)
+            repaired_script,
+            words_per_minute=getattr(self.llm_provider, "words_per_minute", 140),
+            evidence_catalog=catalog,
         )
 
         # 5. Targeted recheck of changed or replaced claims

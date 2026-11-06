@@ -254,7 +254,8 @@ input:focus, select:focus, textarea:focus {
 }
 
 /* Modals */
-.modal-overlay {
+.modal-overlay,
+.modal-backdrop {
   position: fixed;
   inset: 0;
   background-color: rgba(0, 0, 0, 0.7);
@@ -274,6 +275,13 @@ input:focus, select:focus, textarea:focus {
   max-width: 540px;
   box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5);
   overflow: hidden;
+}
+
+.modal-card.modal-lg {
+  max-width: 820px;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
 }
 
 .modal-header {
@@ -489,3 +497,20 @@ input:focus, select:focus, textarea:focus {
   padding: 0.75rem 1rem;
   border-radius: var(--radius-sm);
 }
+
+/* Script Claim & Fact-Checking Badges (Phase 6 Checkpoint 3) */
+.claim-card {
+  position: relative;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.claim-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+  border-color: var(--accent-blue) !important;
+}
+
+.claim-card:active {
+  transform: translateY(0);
+}
+

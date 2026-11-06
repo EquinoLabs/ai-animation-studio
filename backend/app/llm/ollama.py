@@ -48,7 +48,7 @@ class OllamaLLMProvider(LLMProvider):
             "prompt": prompt,
             "format": "json",
             "stream": False,
-            "keep_alive": 0,  # Free GPU/VRAM immediately after generation
+            "keep_alive": "5m",  # Keep model warm for multi-step pipeline (unloads after 5 min idle)
             "options": {
                 "temperature": 0.7,
                 "repeat_penalty": 1.15,

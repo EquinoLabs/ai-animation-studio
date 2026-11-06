@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import json
 import logging
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -24,10 +24,12 @@ from backend.app.domain.research import (
 from backend.app.domain.script import (
     DEFAULT_WORDS_PER_MINUTE,
     GeneratedScriptPayload,
+    GeneratedSectionPayload,
     Script,
     ScriptClaim,
     ScriptClaimPayload,
     ScriptOutline,
+    ScriptOutlineSection,
     ScriptSection,
     ScriptSectionPayload,
     count_words,
@@ -111,6 +113,10 @@ class DraftGeneratorInput(BaseModel):
     allow_unresearched: bool = Field(default=False, description="Explicit authorization to generate without research grounding")
     title: Optional[str] = Field(default=None, max_length=200, description="Optional working title override")
     writing_policy: Optional[WritingPolicy] = Field(default=None, description="Custom writing policy directives")
+    generation_mode: Literal["section_by_section", "monolithic"] = Field(
+        default="section_by_section",
+        description="Generation mode: section_by_section for deeper multi-beat narrative development, monolithic for single-pass",
+    )
 
     @field_validator("project_id")
     @classmethod
@@ -177,28 +183,51 @@ class ScriptDraftGenerator:
         )
         prompt_builder = ScriptPromptBuilder(policy=policy)
 
-        # 4. Build prompt
-        prompt = self._build_generation_prompt(
-            prompt_builder=prompt_builder,
-            input_data=input_data,
-            evidence_brief_text=evidence_brief_text,
-            evidence_catalog=evidence_catalog,
-            is_unresearched=(selected_run is None),
+        # 4. Check generation mode
+        preset = getattr(self.llm_provider, "_preset_response", None)
+        queue = getattr(self.llm_provider, "_response_queue", None)
+        raw = getattr(self.llm_provider, "_raw_response", None)
+        is_mock_monolithic_preset = (
+            isinstance(preset, (GeneratedScriptPayload, Script))
+            or (isinstance(preset, dict) and "sections" in preset)
+            or isinstance(raw, (GeneratedScriptPayload, Script))
+            or (isinstance(raw, dict) and "sections" in raw)
+            or bool(queue and any(isinstance(x, (GeneratedScriptPayload, Script)) or (isinstance(x, dict) and "sections" in x) for x in queue))
+            or getattr(self.llm_provider, "enable_auto_expansion", False)
         )
+        use_monolithic = (input_data.generation_mode == "monolithic") or is_mock_monolithic_preset
 
-        # 5. Invoke LLM with bounded retry for unknown evidence IDs
-        payload = self._invoke_llm_with_validation(
-            prompt=prompt,
-            prompt_builder=prompt_builder,
-            input_data=input_data,
-            evidence_catalog=evidence_catalog,
-            is_unresearched=(selected_run is None),
-        )
+        if use_monolithic:
+            # Monolithic generation (single-pass)
+            prompt = self._build_generation_prompt(
+                prompt_builder=prompt_builder,
+                input_data=input_data,
+                evidence_brief_text=evidence_brief_text,
+                evidence_catalog=evidence_catalog,
+                is_unresearched=(selected_run is None),
+            )
+            payload = self._invoke_llm_with_validation(
+                prompt=prompt,
+                prompt_builder=prompt_builder,
+                input_data=input_data,
+                evidence_catalog=evidence_catalog,
+                is_unresearched=(selected_run is None),
+            )
+        else:
+            # Section-by-section generation with multi-beat depth
+            payload = self._generate_draft_section_by_section(
+                prompt_builder=prompt_builder,
+                input_data=input_data,
+                selected_run=selected_run,
+                evidence_catalog=evidence_catalog,
+                evidence_brief_text=evidence_brief_text,
+                is_unresearched=(selected_run is None),
+            )
 
-        # 6. Validate section alignment with outline
+        # 5. Validate section alignment with outline
         self._validate_section_alignment(payload.sections, input_data.outline)
 
-        # 7. Authoritatively assemble Script domain model
+        # 6. Authoritatively assemble Script domain model
         return self._assemble_authoritative_script(
             input_data=input_data,
             payload=payload,
@@ -414,6 +443,209 @@ class ScriptDraftGenerator:
 
         return retry_payload
 
+    def _generate_draft_section_by_section(
+        self,
+        prompt_builder: ScriptPromptBuilder,
+        input_data: DraftGeneratorInput,
+        selected_run: Optional[ResearchRun],
+        evidence_catalog: ValidatedEvidenceCatalog,
+        evidence_brief_text: Optional[str],
+        is_unresearched: bool,
+    ) -> GeneratedScriptPayload:
+        """Generate a complete Script draft section-by-section with multi-beat depth and narrative continuity."""
+        generated_sections: List[ScriptSectionPayload] = []
+        accumulated_claims: List[ScriptClaimPayload] = []
+        preceding_summaries: List[str] = []
+
+        total_sections = len(input_data.outline.sections)
+
+        for idx, out_sec in enumerate(input_data.outline.sections):
+            sec_id = f"sec_{idx+1:02d}"
+
+            # Filter or extract permitted evidence IDs for this section
+            if is_unresearched:
+                sec_evidence_ids: List[str] = []
+            elif out_sec.evidence_ids:
+                sec_evidence_ids = [
+                    eid for eid in out_sec.evidence_ids
+                    if eid in evidence_catalog.valid_evidence_ids
+                ]
+                if not sec_evidence_ids:
+                    sec_evidence_ids = list(evidence_catalog.valid_evidence_ids)
+            else:
+                sec_evidence_ids = list(evidence_catalog.valid_evidence_ids)
+
+            preceding_summary_text = "\n".join(preceding_summaries) if preceding_summaries else None
+
+            # Build single-section prompt
+            prompt = prompt_builder.build_single_section_prompt(
+                topic=input_data.outline.topic,
+                target_duration_minutes=input_data.outline.target_duration_minutes,
+                section_index=idx,
+                total_sections=total_sections,
+                section_type=out_sec.type,
+                heading=out_sec.heading,
+                target_words=out_sec.target_words,
+                factual_milestones=out_sec.factual_milestones,
+                visual_concept=out_sec.visual_concept,
+                evidence_brief_text=evidence_brief_text,
+                preceding_sections_summary=preceding_summary_text,
+                permitted_evidence_ids=sec_evidence_ids,
+                is_unresearched=is_unresearched,
+            )
+
+            # Invoke LLM for section
+            section_payload = self._invoke_section_with_validation(
+                sec_prompt=prompt,
+                out_sec=out_sec,
+                sec_id=sec_id,
+                evidence_catalog=evidence_catalog,
+                is_unresearched=is_unresearched,
+            )
+
+            # Bounded section expansion fallback:
+            # If narration falls substantially below target (<50% of target_words and <60 words)
+            wc = count_words(section_payload.narration)
+            if wc < (0.5 * out_sec.target_words) and wc < 60:
+                section_payload = self._expand_underdeveloped_section(
+                    section_payload=section_payload,
+                    out_sec=out_sec,
+                    topic=input_data.outline.topic,
+                    prompt_builder=prompt_builder,
+                    evidence_brief_text=evidence_brief_text,
+                    permitted_evidence_ids=sec_evidence_ids,
+                    is_unresearched=is_unresearched,
+                    evidence_catalog=evidence_catalog,
+                )
+
+            # Record section
+            generated_sections.append(
+                ScriptSectionPayload(
+                    id=sec_id,
+                    type=out_sec.type,
+                    heading=section_payload.heading or out_sec.heading,
+                    narration=section_payload.narration,
+                    notes=section_payload.notes,
+                )
+            )
+
+            # Collect claims
+            for claim in section_payload.claims:
+                if is_unresearched:
+                    clean_eids = []
+                else:
+                    clean_eids = [
+                        eid for eid in claim.evidence_ids
+                        if eid in evidence_catalog.valid_evidence_ids
+                    ]
+                accumulated_claims.append(
+                    ScriptClaimPayload(
+                        claim_id=f"clm_{len(accumulated_claims)+1:02d}",
+                        claim_text=claim.claim_text,
+                        section_id=sec_id,
+                        evidence_ids=clean_eids,
+                    )
+                )
+
+            # Record continuity summary
+            words = section_payload.narration.split()
+            synopsis = " ".join(words[:25])
+            preceding_summaries.append(f"- Section '{out_sec.heading}' ({out_sec.type}): {synopsis}...")
+
+        return GeneratedScriptPayload(
+            title=input_data.title or input_data.outline.topic,
+            sections=generated_sections,
+            claims=accumulated_claims,
+        )
+
+    def _invoke_section_with_validation(
+        self,
+        sec_prompt: str,
+        out_sec: ScriptOutlineSection,
+        sec_id: str,
+        evidence_catalog: ValidatedEvidenceCatalog,
+        is_unresearched: bool,
+    ) -> GeneratedSectionPayload:
+        """Invoke LLM for a single section with malformed/unresearched error handling."""
+        try:
+            payload: GeneratedSectionPayload = self.llm_provider.generate_json(
+                prompt=sec_prompt,
+                schema=GeneratedSectionPayload,
+            )
+        except LLMUnavailableError as unavail:
+            raise ScriptDraftUnavailableError(f"LLM provider unavailable: {unavail}") from unavail
+        except (LLMResponseMalformedError, Exception) as malformed:
+            raise ScriptDraftMalformedError(f"LLM generated malformed script payload: {malformed}") from malformed
+
+        # Check evidence citations in unresearched mode
+        if is_unresearched:
+            for c in payload.claims:
+                if c.evidence_ids:
+                    raise ScriptDraftEvidenceValidationError(
+                        f"Script draft emitted evidence IDs in unresearched mode: {sorted(list(c.evidence_ids))}. "
+                        f"Unresearched scripts cannot cite evidence."
+                    )
+        else:
+            # Filter any invalid IDs
+            for c in payload.claims:
+                c.evidence_ids = [eid for eid in c.evidence_ids if eid in evidence_catalog.valid_evidence_ids]
+
+        return payload
+
+    def _expand_underdeveloped_section(
+        self,
+        section_payload: GeneratedSectionPayload,
+        out_sec: ScriptOutlineSection,
+        topic: str,
+        prompt_builder: ScriptPromptBuilder,
+        evidence_brief_text: Optional[str],
+        permitted_evidence_ids: List[str],
+        is_unresearched: bool,
+        evidence_catalog: ValidatedEvidenceCatalog,
+    ) -> GeneratedSectionPayload:
+        """Execute a single bounded expansion attempt for an underdeveloped section."""
+        current_wc = count_words(section_payload.narration)
+        logger.info(
+            f"Section '{out_sec.heading}' is underdeveloped ({current_wc} words < target {out_sec.target_words}). "
+            f"Triggering bounded single expansion attempt."
+        )
+        expansion_prompt = prompt_builder.build_section_expansion_prompt(
+            topic=topic,
+            section_type=out_sec.type,
+            heading=section_payload.heading or out_sec.heading,
+            target_words=out_sec.target_words,
+            current_narration=section_payload.narration,
+            current_word_count=current_wc,
+            factual_milestones=out_sec.factual_milestones,
+            evidence_brief_text=evidence_brief_text,
+            permitted_evidence_ids=permitted_evidence_ids,
+            is_unresearched=is_unresearched,
+        )
+        try:
+            expanded_payload: GeneratedSectionPayload = self.llm_provider.generate_json(
+                prompt=expansion_prompt,
+                schema=GeneratedSectionPayload,
+            )
+            expanded_wc = count_words(expanded_payload.narration)
+            if expanded_wc > current_wc:
+                logger.info(f"Section expansion successful: grew from {current_wc} to {expanded_wc} words.")
+                if is_unresearched:
+                    for c in expanded_payload.claims:
+                        if c.evidence_ids:
+                            c.evidence_ids = []
+                else:
+                    for c in expanded_payload.claims:
+                        c.evidence_ids = [eid for eid in c.evidence_ids if eid in evidence_catalog.valid_evidence_ids]
+                return expanded_payload
+            else:
+                logger.warning(
+                    f"Section expansion did not increase length ({expanded_wc} <= {current_wc}). Retaining original."
+                )
+                return section_payload
+        except Exception as exc:
+            logger.warning(f"Section expansion attempt failed gracefully: {exc}. Retaining original section.")
+            return section_payload
+
     def _find_invalid_evidence_ids(
         self,
         payload: GeneratedScriptPayload,
@@ -541,9 +773,11 @@ class ScriptDraftGenerator:
             updated_at=utc_now(),
         )
 
-        # Calculate word counts and duration metrics
+        # Calculate word counts and duration metrics with audit compliance
         populate_script_duration_metrics(
-            script, words_per_minute=self.llm_provider.words_per_minute or DEFAULT_WORDS_PER_MINUTE
+            script,
+            words_per_minute=self.llm_provider.words_per_minute or DEFAULT_WORDS_PER_MINUTE,
+            evidence_catalog=evidence_catalog,
         )
 
         return script

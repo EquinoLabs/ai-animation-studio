@@ -1,7 +1,16 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import './styles.css';
 import { api, ApiError } from './api';
-import { ProjectMetadata, Script, WorkflowState, ConversationEvent } from './types';
+import {
+  ProjectMetadata,
+  Script,
+  WorkflowState,
+  ConversationEvent,
+  ScriptFactCheckReport,
+  ResearchOverviewResponse,
+  ChallengeAction,
+  ChallengeSummary,
+} from './types';
 import { ProjectBar } from './components/ProjectBar';
 import { ScriptViewer } from './components/ScriptViewer';
 import { ResearchStudioPanel } from './components/ResearchStudioPanel';
@@ -26,6 +35,12 @@ export const App: React.FC = () => {
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [submittingModal, setSubmittingModal] = useState<boolean>(false);
+
+  // Phase 6 Checkpoint 3 Fact-Checking & Challenge state
+  const [factCheckReport, setFactCheckReport] = useState<ScriptFactCheckReport | null>(null);
+  const [researchOverview, setResearchOverview] = useState<ResearchOverviewResponse | null>(null);
+  const [challengingClaim, setChallengingClaim] = useState<boolean>(false);
+  const [challengeResult, setChallengeResult] = useState<ChallengeSummary | null>(null);
 
   // Modals
   const [showFinalizeModal, setShowFinalizeModal] = useState<boolean>(false);
@@ -83,13 +98,18 @@ export const App: React.FC = () => {
     try {
       setLoading(true);
       setError(null);
-      const [stateRes, histRes] = await Promise.all([
+      const [stateRes, histRes, repRes, ovRes] = await Promise.all([
         api.getScriptState(projectId),
         api.getConversationHistory(projectId),
+        api.getFactCheckReport(projectId).catch(() => null),
+        api.getResearchOverview(projectId).catch(() => null),
       ]);
       setScript(stateRes.script);
       setWorkflowState(stateRes.workflow_state);
       setHistory(histRes);
+      setFactCheckReport(repRes);
+      setResearchOverview(ovRes);
+      setChallengeResult(null);
     } catch (err) {
       setError(err instanceof ApiError ? err.detail : 'Failed to load script data.');
     } finally {
@@ -99,11 +119,21 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     if (currentProjectId) {
+      // Clear previous project data immediately to prevent stale cross-project display
+      setScript(null);
+      setWorkflowState({ accepted_version: null, rejected_version: null, rejection_reason: null });
+      setHistory([]);
+      setFactCheckReport(null);
+      setResearchOverview(null);
+      setChallengeResult(null);
       loadProjectData(currentProjectId);
     } else {
       setScript(null);
       setWorkflowState({ accepted_version: null, rejected_version: null, rejection_reason: null });
       setHistory([]);
+      setFactCheckReport(null);
+      setResearchOverview(null);
+      setChallengeResult(null);
     }
   }, [currentProjectId, loadProjectData]);
 
@@ -128,8 +158,14 @@ export const App: React.FC = () => {
       const res = await api.startScript(currentProjectId, topic, durationMinutes, title);
       setScript(res.script);
       setWorkflowState(res.workflow_state);
-      const hist = await api.getConversationHistory(currentProjectId);
+      const [hist, rep, ov] = await Promise.all([
+        api.getConversationHistory(currentProjectId),
+        api.getFactCheckReport(currentProjectId).catch(() => null),
+        api.getResearchOverview(currentProjectId).catch(() => null),
+      ]);
       setHistory(hist);
+      setFactCheckReport(rep);
+      if (ov) setResearchOverview(ov);
     } catch (err) {
       setError(err instanceof ApiError ? err.detail : 'Failed to generate initial script.');
     } finally {
@@ -145,12 +181,51 @@ export const App: React.FC = () => {
       const res = await api.reviseScript(currentProjectId, instruction);
       setScript(res.script);
       setWorkflowState(res.workflow_state);
-      const hist = await api.getConversationHistory(currentProjectId);
+      const [hist, rep, ov] = await Promise.all([
+        api.getConversationHistory(currentProjectId),
+        api.getFactCheckReport(currentProjectId).catch(() => null),
+        api.getResearchOverview(currentProjectId).catch(() => null),
+      ]);
       setHistory(hist);
+      setFactCheckReport(rep);
+      if (ov) setResearchOverview(ov);
     } catch (err) {
       setError(err instanceof ApiError ? err.detail : 'Failed to revise script.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleChallengeClaim = async (
+    claimId: string,
+    action: ChallengeAction,
+    instruction?: string
+  ) => {
+    if (!currentProjectId) return;
+    try {
+      setChallengingClaim(true);
+      setError(null);
+      const res = await api.challengeClaim(currentProjectId, {
+        claim_id: claimId,
+        action,
+        instruction,
+      });
+      setScript(res.script);
+      setWorkflowState(res.workflow_state);
+      setFactCheckReport(res.fact_check_report || null);
+      setChallengeResult(res.challenge_summary);
+
+      const [hist, ov] = await Promise.all([
+        api.getConversationHistory(currentProjectId),
+        api.getResearchOverview(currentProjectId).catch(() => null),
+      ]);
+      setHistory(hist);
+      if (ov) setResearchOverview(ov);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.detail : 'Claim challenge failed.');
+      throw err;
+    } finally {
+      setChallengingClaim(false);
     }
   };
 
@@ -273,16 +348,23 @@ export const App: React.FC = () => {
                 script={script}
                 workflowState={workflowState}
                 loading={loading}
+                factCheckReport={factCheckReport}
+                researchOverview={researchOverview}
                 onStartScript={handleStartScript}
                 onAcceptDraft={handleAcceptDraft}
                 onOpenRejectModal={() => setShowRejectModal(true)}
                 onOpenFinalizeModal={() => setShowFinalizeModal(true)}
                 onOpenVersionsModal={() => setShowVersionsModal(true)}
+                onChallengeClaim={handleChallengeClaim}
+                challengingClaim={challengingClaim}
+                challengeResult={challengeResult}
               />
             ) : (
               <ResearchStudioPanel
                 projectId={currentProjectId}
+                projectTitle={projects.find((p) => p.project_id === currentProjectId)?.title}
                 currentScriptVersion={script?.version}
+                onResearchCompleted={() => loadProjectData(currentProjectId)}
               />
             )
           ) : (
@@ -305,6 +387,8 @@ export const App: React.FC = () => {
             script={script}
             loading={loading}
             onSendRevision={handleReviseScript}
+            onChallengeClaim={handleChallengeClaim}
+            factCheckReport={factCheckReport}
           />
         </aside>
       </div>

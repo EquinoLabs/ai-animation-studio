@@ -12,6 +12,8 @@ def utc_now() -> datetime:
 # 1. Script Contract
 from backend.app.domain.script import (  # noqa: E402
     ClaimLinkStatus,
+    DurationComplianceReport,
+    DurationComplianceStatus,
     Script,
     ScriptClaim,
     ScriptOutline,

@@ -301,6 +301,7 @@ def test_draft_generation_from_supplied_outline(lifecycle_env):
         topic="Pre-outlined Topic",
         outline=outline,
         allow_unresearched=True,
+        generation_mode="monolithic",
     )
     assert script.version == 1
     # Only one LLM call occurred for script drafting, none for outline

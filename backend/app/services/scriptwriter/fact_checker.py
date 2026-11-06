@@ -37,6 +37,10 @@ from backend.app.llm.base import (
     LLMUnavailableError,
 )
 from backend.app.llm.ollama import OllamaLLMProvider
+from backend.app.services.research.orchestrator import (
+    is_challenge_or_gatekeeper,
+    is_navigation_or_chrome,
+)
 from backend.app.services.scriptwriter.outliner import ValidatedEvidenceCatalog
 
 logger = logging.getLogger(__name__)
@@ -88,12 +92,23 @@ RISK LEVELS & RHETORICAL / CREATIVE EXPRESSIONS:
   * Do NOT evaluate metaphors, analogies, or figures of speech as "contradicted" unless they assert an explicitly false factual claim.
   * If the proposition is an acceptable metaphor or stylistic flourish, assign status "supported" or "not_checked" with recommended_action "keep".
 
-STRICT EVIDENCE PROVENANCE RULES:
-- You may ONLY cite evidence IDs that are explicitly listed under that specific claim's 'PERMITTED EVIDENCE' section.
-- You must NOT cite evidence IDs that were not supplied for that claim.
-- You must NOT cite evidence IDs that belong to other claims or other projects.
-- You must NOT fabricate or invent evidence IDs.
-- If there is no evidence or the evidence is insufficient, leave supporting_evidence_ids, contradicting_evidence_ids, and contextual_evidence_ids as empty lists [].
+STRICT EVIDENCE PROVENANCE & GROUNDING RULES:
+1. EXCERPT TEXT IS THE SOLE FACTUAL BASIS:
+   - You MUST evaluate whether the proposition is substantiated EXCLUSIVELY by the verbatim text inside 'Excerpt'.
+   - Source titles, URLs, and publisher names provide external catalog context only; they do NOT establish proof or substantiation.
+   - NEVER mark a claim "supported" based on a source title or headline if the excerpt text itself does not state the factual proposition.
+2. NO PARAMETRIC HALLUCINATION:
+   - Even if you know from your general knowledge that a proposition is historically, scientifically, or objectively true, if the provided 'Excerpt' does not explicitly state it, you MUST assign "unsupported" (or "partially_supported" if only partially confirmed).
+   - NEVER mark a claim "supported" relying on outside knowledge when the excerpt is missing, silent, or unrelated.
+3. BOILERPLATE, COOKIE, OR IRRELEVANT EXCERPTS:
+   - If an excerpt contains cookie notices, access-denied text, navigation links, or completely unrelated statements, it CANNOT support the claim.
+   - In such cases, you MUST assign status "unsupported" and leave supporting_evidence_ids as [].
+4. PERMITTED CITATIONS:
+   - You may ONLY cite evidence IDs that are explicitly listed under that specific claim's 'PERMITTED EVIDENCE' section.
+   - You must NOT cite evidence IDs that were not supplied for that claim.
+   - You must NOT cite evidence IDs that belong to other claims or other projects.
+   - You must NOT fabricate or invent evidence IDs.
+   - If there is no evidence or the evidence is insufficient, leave supporting_evidence_ids, contradicting_evidence_ids, and contextual_evidence_ids as empty lists [].
 
 RECOMMENDED ACTIONS:
 - "keep": Claim is verified or acceptable creative expression.
@@ -525,13 +540,41 @@ class ScriptFactChecker:
                     source = catalog.sources_by_id.get(ev.source_id)
                     source_title = source.title if source else "Source"
                     excerpt = (ev.excerpt or "").strip().replace("\n", " ")
-                    lines.append(f"- ID: {eid} | Source: {source_title} | Excerpt: \"{excerpt}\"")
+                    lines.append(f"- ID: {eid} | Excerpt: \"{excerpt}\" | (Context: Source title is '{source_title}')")
             else:
                 lines.append("- (No verified evidence supplied for this claim)")
             lines.append("")
 
         lines.append("=== END BATCH REQUEST ===")
-        lines.append("Respond with valid JSON containing the assessments list.")
+        lines.append("")
+        lines.append("REQUIRED JSON OUTPUT SCHEMA:")
+        lines.append("You MUST output strictly valid JSON matching this exact structure. Every assessment object MUST include all 7 fields:")
+        lines.append("{")
+        lines.append('  "assessments": [')
+        lines.append("    {")
+        lines.append('      "claim_id": "clm_01",')
+        lines.append('      "status": "supported",')
+        lines.append('      "explanation": "Explain precisely how the supplied excerpt supports the complete proposition.",')
+        lines.append('      "supporting_evidence_ids": ["evi_01"],')
+        lines.append('      "contradicting_evidence_ids": [],')
+        lines.append('      "contextual_evidence_ids": [],')
+        lines.append('      "recommended_action": "keep"')
+        lines.append("    }")
+        lines.append("  ]")
+        lines.append("}")
+        lines.append("")
+        lines.append("MANDATORY FIELD DEFINITIONS & RULES:")
+        lines.append("1. 'claim_id' (string, required): Exactly one assessment for every requested claim ID in this batch.")
+        lines.append("2. 'status' (string, required): MUST be exactly one of: 'supported', 'partially_supported', 'conflicting', 'unsupported', 'not_checked', 'contradicted'.")
+        lines.append("   - 'status' is mandatory on every entry. Never omit this field.")
+        lines.append("   - The illustrative schema example above shows 'supported', but you MUST choose the status justified by the actual excerpt. If the excerpt does not substantiate the claim, you must choose 'unsupported'.")
+        lines.append("   - Source titles, metadata, model knowledge, and search snippets cannot establish support.")
+        lines.append("3. 'explanation' (string, required): Non-empty explanation detailing how the excerpt proves, refutes, or fails to address the claim.")
+        lines.append("4. 'supporting_evidence_ids' (list of strings): IDs of evidence directly confirming the proposition. (Must come from PERMITTED EVIDENCE, else []).")
+        lines.append("5. 'contradicting_evidence_ids' (list of strings): IDs of evidence directly refuting the proposition (else []).")
+        lines.append("6. 'contextual_evidence_ids' (list of strings): IDs of evidence providing background without verifying (else []).")
+        lines.append("   - Supporting, contradicting, and contextual evidence have distinct meanings. Do NOT use generic 'evidence_ids'.")
+        lines.append("7. 'recommended_action' (string, required): Exactly one of: 'keep', 'qualify', 'remove', 'rephrase'.")
         return "\n".join(lines)
 
     def _invoke_batch_with_retry(
@@ -551,7 +594,12 @@ class ScriptFactChecker:
         except (LLMUnavailableError, TimeoutError, OSError) as conn_err:
             raise ScriptFactCheckUnavailableError(f"LLM provider error: {conn_err}") from conn_err
         except (LLMResponseMalformedError, json.JSONDecodeError, Exception) as malformed:
-            logger.warning("LLM emitted malformed JSON for batch. Executing corrective retry.")
+            raw_snippet = str(getattr(malformed, "raw_response", "")) or str(malformed)[:300]
+            logger.warning(
+                "LLM emitted malformed JSON for batch: %s | Diagnostic snippet: %s. Executing corrective retry.",
+                malformed,
+                raw_snippet,
+            )
             return self._execute_corrective_retry(
                 prompt=prompt,
                 validation_error=f"Malformed JSON response: {malformed}",
@@ -569,7 +617,7 @@ class ScriptFactChecker:
         )
 
         if is_valid:
-            return self._build_claim_assessments(payload, batch_claims, claim_supplied_eids)
+            return self._build_claim_assessments(payload, batch_claims, claim_supplied_eids, catalog=catalog)
 
         # 3. Validation failed: execute one bounded corrective retry
         logger.warning(
@@ -592,24 +640,45 @@ class ScriptFactChecker:
         catalog: Optional[ValidatedEvidenceCatalog],
         claim_supplied_eids: Dict[str, Set[str]],
     ) -> List[ClaimAssessment]:
-        """Perform exactly one bounded corrective retry with explicit error feedback."""
+        """Perform exactly one bounded corrective retry with explicit error feedback and schema structure."""
         expected_ids = sorted([c.claim_id for c in batch_claims])
         allowed_ids_summary = {
             cid: sorted(list(eids)) for cid, eids in claim_supplied_eids.items()
         }
+        first_id = expected_ids[0] if expected_ids else "clm_01"
 
         retry_prompt = (
             f"{prompt}\n\n"
             f"--- CORRECTION REQUIRED ---\n"
-            f"Your previous response was rejected due to validation errors:\n"
+            f"Your previous response was rejected due to schema or validation errors:\n"
             f"ERROR: {validation_error}\n\n"
             f"STRICT CORRECTIVE REQUIREMENTS:\n"
             f"1. You must return an assessment for EXACTLY these claim IDs: {expected_ids}.\n"
             f"2. Do NOT omit any claim ID and do NOT return duplicate claim IDs.\n"
-            f"3. For each claim, you may ONLY cite evidence IDs that were supplied for it:\n"
-            f"   Permitted evidence mapping: {allowed_ids_summary}\n"
-            f"4. If no evidence was supplied for a claim, all evidence ID lists must be empty [].\n"
-            f"5. Output valid JSON adhering to BatchFactCheckResponsePayload.\n"
+            f"3. Every assessment object in 'assessments' MUST include all 7 required fields:\n"
+            f"   - 'claim_id': string matching the requested claim ID\n"
+            f"   - 'status': mandatory string, one of ['supported', 'partially_supported', 'conflicting', 'unsupported', 'not_checked', 'contradicted']\n"
+            f"   - 'explanation': mandatory non-empty explanation string\n"
+            f"   - 'supporting_evidence_ids': list of evidence IDs from permitted evidence (never use generic 'evidence_ids')\n"
+            f"   - 'contradicting_evidence_ids': list of evidence IDs refuting the proposition\n"
+            f"   - 'contextual_evidence_ids': list of evidence IDs providing background\n"
+            f"   - 'recommended_action': one of ['keep', 'qualify', 'remove', 'rephrase']\n"
+            f"4. Permitted evidence mapping per claim: {allowed_ids_summary}\n"
+            f"   If no evidence was supplied for a claim, all evidence ID lists must be empty [].\n"
+            f"5. Output valid JSON matching this exact structure:\n"
+            f"{{\n"
+            f'  "assessments": [\n'
+            f'    {{\n'
+            f'      "claim_id": "{first_id}",\n'
+            f'      "status": "unsupported",\n'
+            f'      "explanation": "State clearly how the supplied excerpt supports or fails to support the proposition.",\n'
+            f'      "supporting_evidence_ids": [],\n'
+            f'      "contradicting_evidence_ids": [],\n'
+            f'      "contextual_evidence_ids": [],\n'
+            f'      "recommended_action": "qualify"\n'
+            f'    }}\n'
+            f'  ]\n'
+            f"}}\n"
             f"--- END CORRECTION REQUIRED ---"
         )
 
@@ -623,6 +692,12 @@ class ScriptFactChecker:
                 f"LLM provider error on retry: {conn_err}"
             ) from conn_err
         except (LLMResponseMalformedError, json.JSONDecodeError, Exception) as malformed:
+            raw_snippet = str(getattr(malformed, "raw_response", "")) or str(malformed)[:300]
+            logger.warning(
+                "LLM emitted malformed response on retry: %s | Diagnostic snippet: %s",
+                malformed,
+                raw_snippet,
+            )
             raise ScriptFactCheckMalformedError(
                 f"LLM generated malformed response on retry: {malformed}"
             ) from malformed
@@ -635,11 +710,21 @@ class ScriptFactChecker:
         )
 
         if not is_valid:
+            # If the failure is due to ungrounded evidence or boilerplate citations,
+            # fail safely by building claim assessments where invalid citations are downgraded to unsupported
+            err_lower = (error_msg or "").lower()
+            if any(term in err_lower for term in ("boilerplate", "cookie", "challenge", "navigation", "zero lexical overlap", "zero token overlap")):
+                logger.warning(
+                    "Corrective retry cited invalid or ungrounded evidence (%s). Failing safely to unsupported.",
+                    error_msg,
+                )
+                return self._build_claim_assessments(retry_payload, batch_claims, claim_supplied_eids, catalog=catalog)
+
             raise ScriptFactCheckMalformedError(
                 f"Corrective retry failed validation: {error_msg}"
             )
 
-        return self._build_claim_assessments(retry_payload, batch_claims, claim_supplied_eids)
+        return self._build_claim_assessments(retry_payload, batch_claims, claim_supplied_eids, catalog=catalog)
 
     def _validate_batch_response(
         self,
@@ -674,6 +759,7 @@ class ScriptFactChecker:
             return False, "; ".join(id_errors)
 
         # 3. Check evidence citations and provenance
+        claims_by_id = {c.claim_id: c for c in batch_claims}
         valid_cat_eids = catalog.valid_evidence_ids if catalog else set()
         for assessment in payload.assessments:
             # 3a. Status check
@@ -714,6 +800,49 @@ class ScriptFactChecker:
                     f"{sorted(list(unsupplied))}. Permitted for this claim: {sorted(list(supplied_for_claim))}",
                 )
 
+            # 3d. Substantive evidence validation for supported claims
+            if assessment.status == "supported":
+                if not assessment.supporting_evidence_ids:
+                    return (
+                        False,
+                        f"Claim '{assessment.claim_id}' was assigned status 'supported' but provided no supporting_evidence_ids.",
+                    )
+                if catalog:
+                    for eid in assessment.supporting_evidence_ids:
+                        ev = catalog.evidence_by_id.get(eid)
+                        if ev:
+                            if is_challenge_or_gatekeeper(ev.excerpt):
+                                return (
+                                    False,
+                                    f"Claim '{assessment.claim_id}' cited evidence '{eid}' as supporting, "
+                                    f"but that excerpt contains an anti-bot/cookie challenge notice and cannot substantiate claims.",
+                                )
+                            if is_navigation_or_chrome(ev.excerpt):
+                                return (
+                                    False,
+                                    f"Claim '{assessment.claim_id}' cited evidence '{eid}' as supporting, "
+                                    f"but that excerpt contains navigation chrome and cannot substantiate claims.",
+                                )
+                            # Title inference warning when excerpt has zero content overlap
+                            prop_text = claims_by_id[assessment.claim_id].claim_text if assessment.claim_id in claims_by_id else ""
+                            prop_tokens = set(_extract_proposition_tokens(prop_text))
+                            excerpt_tokens = set(_extract_proposition_tokens(ev.excerpt))
+                            source = catalog.sources_by_id.get(ev.source_id)
+                            title_tokens = set(_extract_proposition_tokens(source.title)) if (source and source.title) else set()
+                            expl_lower = assessment.explanation.lower()
+                            if len(prop_tokens & excerpt_tokens) == 0 and len(prop_tokens) >= 3:
+                                if (
+                                    (source and source.title and source.title.lower() in expl_lower)
+                                    or "title" in expl_lower
+                                    or len(title_tokens & prop_tokens) >= 2
+                                ):
+                                    return (
+                                        False,
+                                        f"Claim '{assessment.claim_id}' cited evidence '{eid}' as supporting, "
+                                        f"but excerpt has zero lexical overlap with proposition and explanation relies on source title. "
+                                        f"Support must be established strictly from excerpt text.",
+                                    )
+
         return True, None
 
     def _build_claim_assessments(
@@ -721,6 +850,7 @@ class ScriptFactChecker:
         payload: BatchFactCheckResponsePayload,
         batch_claims: List[ScriptClaim],
         claim_supplied_eids: Dict[str, Set[str]],
+        catalog: Optional[ValidatedEvidenceCatalog] = None,
     ) -> List[ClaimAssessment]:
         """Construct authoritative ClaimAssessment domain objects from validated payload."""
         claims_by_id = {c.claim_id: c for c in batch_claims}
@@ -731,18 +861,43 @@ class ScriptFactChecker:
             risk = getattr(claim, "risk_level", None) or "normal"
             supplied_ids = sorted(list(claim_supplied_eids.get(claim.claim_id, set())))
 
+            status = p_item.status
+            explanation = p_item.explanation.strip()
+            supporting_ids = sorted(list(set(p_item.supporting_evidence_ids)))
+            recommended_action = p_item.recommended_action
+
+            # Defensive post-validation safeguard: ensure supported status cannot survive on invalid evidence
+            if status == "supported":
+                if not supporting_ids:
+                    status = "unsupported"
+                    explanation += " [Audited: Claim provided no supporting evidence records; downgraded to unsupported.]"
+                    recommended_action = "qualify" if risk != "high" else "remove"
+                elif catalog:
+                    valid_supporting = []
+                    for eid in supporting_ids:
+                        ev = catalog.evidence_by_id.get(eid)
+                        if ev and (is_challenge_or_gatekeeper(ev.excerpt) or is_navigation_or_chrome(ev.excerpt)):
+                            logger.warning("Dropping invalid boilerplate evidence citation '%s' from claim '%s'.", eid, claim.claim_id)
+                        else:
+                            valid_supporting.append(eid)
+                    supporting_ids = valid_supporting
+                    if not valid_supporting:
+                        status = "unsupported"
+                        explanation += " [Audited: Cited evidence was invalid boilerplate/gatekeeper text; downgraded to unsupported.]"
+                        recommended_action = "qualify" if risk != "high" else "remove"
+
             assessment = ClaimAssessment(
                 claim_id=claim.claim_id,
                 section_id=claim.section_id,
                 proposition=claim.claim_text,
-                status=p_item.status,
+                status=status,
                 risk_level=risk,
-                explanation=p_item.explanation.strip(),
+                explanation=explanation,
                 considered_evidence_ids=supplied_ids,
-                supporting_evidence_ids=sorted(list(set(p_item.supporting_evidence_ids))),
+                supporting_evidence_ids=supporting_ids,
                 contradicting_evidence_ids=sorted(list(set(p_item.contradicting_evidence_ids))),
                 contextual_evidence_ids=sorted(list(set(p_item.contextual_evidence_ids))),
-                recommended_action=p_item.recommended_action,
+                recommended_action=recommended_action,
                 assessed_at=utc_now(),
             )
             assessments.append(assessment)

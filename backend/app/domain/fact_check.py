@@ -77,6 +77,13 @@ class ClaimAssessmentPayload(BaseModel):
             raise ValueError("claim_id cannot be blank.")
         return clean
 
+    @field_validator("supporting_evidence_ids", "contradicting_evidence_ids", "contextual_evidence_ids", mode="before")
+    @classmethod
+    def coerce_evidence_ids(cls, v: Any) -> Any:
+        if isinstance(v, list):
+            return [str(item) for item in v if item is not None and str(item).strip()]
+        return v
+
     @field_validator("explanation")
     @classmethod
     def validate_explanation(cls, v: str) -> str:

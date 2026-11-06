@@ -458,3 +458,38 @@ class ChallengeClaimResponse(BaseModel):
     fact_check_report: Optional[Dict[str, Any]] = None
     challenge_summary: Dict[str, Any] = Field(default_factory=dict)
 
+
+class StartResearchRequest(BaseModel):
+    """Request payload for initiating research planning and execution."""
+    model_config = ConfigDict(extra="forbid")
+
+    topic: str = Field(..., min_length=1, max_length=1000, description="Core topic to research.")
+    target_duration_minutes: Optional[float] = Field(
+        default=None, ge=0.1, le=60.0, description="Intended video duration in minutes if known."
+    )
+    user_guidance: Optional[str] = Field(
+        default=None, max_length=1000, description="Optional user directives or focus points."
+    )
+    budget_limits: Optional[ResearchBudgetConstraints] = Field(
+        default=None, description="Optional custom invocation and content ceilings."
+    )
+
+
+class StartResearchResponse(BaseModel):
+    """Response returned upon initiating or completing research."""
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    plan_id: str
+    run_id: str
+    status: str
+    termination_reason: Optional[str] = None
+    search_calls_used: int = 0
+    extract_calls_used: int = 0
+    total_chars_extracted: int = 0
+    evidence_count: int = 0
+    sources_count: int = 0
+    has_brief: bool = False
+    overview: ResearchOverviewResponse
+
+

@@ -22,6 +22,7 @@ from backend.app.domain.script import (
     DEFAULT_WORDS_PER_MINUTE,
     GeneratedOutlinePayload,
     GeneratedScriptPayload,
+    GeneratedSectionPayload,
     OutlineSectionPayload,
     Script,
     ScriptClaimPayload,
@@ -144,6 +145,18 @@ class MockLLMProvider(LLMProvider):
                         for s in resp.sections
                     ],
                 )
+            if isinstance(self._preset_response, GeneratedScriptPayload) and (schema is GeneratedSectionPayload or schema.__name__ == "GeneratedSectionPayload"):
+                if self._preset_response.sections:
+                    sec = self._preset_response.sections.pop(0)
+                    sec_claims = [c for c in self._preset_response.claims if c.section_id == sec.id]
+                    if not self._preset_response.sections:
+                        self._preset_response = None
+                    return schema(
+                        heading=sec.heading,
+                        narration=sec.narration,
+                        notes=sec.notes or "",
+                        claims=sec_claims,
+                    )
             if isinstance(self._preset_response, dict):
                 resp = self._preset_response
                 self._preset_response = None
@@ -238,11 +251,29 @@ class MockLLMProvider(LLMProvider):
 
         # 7. Fallback deterministic generator for script draft payloads
         if schema is GeneratedScriptPayload or schema.__name__ == "GeneratedScriptPayload":
-            # Extract evidence IDs if present in prompt
             evidence_ids = []
-            ev_matches = re.findall(r"\b(evi_[a-zA-Z0-9_-]+)\b", prompt)
-            if ev_matches:
-                evidence_ids = [ev_matches[0]]
+            if "UNRESEARCHED MODE DIRECTIVE" not in prompt:
+                # Prioritize extracting permitted evidence IDs from constraints or catalog
+                permitted_match = re.search(r"Permitted evidence IDs:\s*\[(.*?)\]", prompt)
+                if permitted_match:
+                    extracted = re.findall(r"['\"](evi_[a-zA-Z0-9_-]+)['\"]", permitted_match.group(1))
+                    if extracted:
+                        evidence_ids = [extracted[0]]
+                if not evidence_ids:
+                    catalog_match = re.search(r"--- RUN EVIDENCE CATALOG ---\s*(.*?)\s*--- END RUN EVIDENCE CATALOG ---", prompt, re.DOTALL)
+                    if catalog_match:
+                        cat_eids = re.findall(r"\b(evi_[a-zA-Z0-9_-]+)\b", catalog_match.group(1))
+                        if cat_eids:
+                            evidence_ids = [cat_eids[0]]
+                if not evidence_ids:
+                    # Filter out example doc IDs 'evi_01', 'evi_02'
+                    real_matches = [m for m in re.findall(r"\b(evi_[a-zA-Z0-9_-]+)\b", prompt) if m not in ("evi_01", "evi_02")]
+                    if real_matches:
+                        evidence_ids = [real_matches[0]]
+                    else:
+                        ev_matches = re.findall(r"\b(evi_[a-zA-Z0-9_-]+)\b", prompt)
+                        if ev_matches:
+                            evidence_ids = [ev_matches[0]]
 
             # Check if prompt specifies unresearched mode
             if "UNRESEARCHED MODE DIRECTIVE" in prompt:
@@ -325,6 +356,66 @@ class MockLLMProvider(LLMProvider):
             return schema(
                 title="Explainer Documentary Draft",
                 sections=sections,
+                claims=claims,
+            )
+
+        # 7b. Fallback deterministic generator for single section payloads
+        if schema is GeneratedSectionPayload or schema.__name__ == "GeneratedSectionPayload":
+            # Extract heading
+            heading_m = re.search(r'Section Heading:\s*"([^"\n]+)"', prompt)
+            heading = heading_m.group(1).strip() if heading_m else "Section Heading"
+
+            # Extract target words
+            tw_m = re.search(r'Target (?:Word Count|Length):\s*~?(\d+)', prompt)
+            target_words = int(tw_m.group(1)) if tw_m else 100
+
+            # Extract section type
+            st_m = re.search(r'Section (?:Role|Type):\s*"(\w+)"', prompt)
+            sec_type = st_m.group(1).lower() if st_m else "middle"
+
+            # Check if this is an expansion prompt
+            is_expansion = "expanding an underdeveloped script section" in prompt.lower() or "current draft narration" in prompt.lower()
+
+            # Permitted evidence IDs
+            eids = []
+            if "UNRESEARCHED MODE DIRECTIVE" not in prompt:
+                perm_m = re.search(r"Permitted evidence IDs:\s*\[(.*?)\]", prompt)
+                if perm_m:
+                    eids = re.findall(r"['\"](evi_[a-zA-Z0-9_-]+)['\"]", perm_m.group(1))
+                if not eids:
+                    eids = [m for m in re.findall(r"\b(evi_[a-zA-Z0-9_-]+)\b", prompt) if m not in ("evi_01", "evi_02")]
+
+            # Generate narration text that hits approximately target_words
+            unit_sentence = (
+                f"In this critical {sec_type} stage, empirical observation and rigorous experimental analysis demonstrate "
+                f"the exact mechanisms governing the system, validating the underlying hypothesis with concrete evidence and reproducibility. "
+            )
+            unit_words = len(unit_sentence.split())
+            needed_reps = max(1, target_words // unit_words)
+            narration = " ".join([unit_sentence.strip()] * needed_reps)
+
+            while len(narration.split()) < target_words - 5:
+                narration += " Furthermore, detailed causal interactions ensure stability and continuity throughout the process."
+
+            # Extract section index / id
+            sec_idx_m = re.search(r'Section (\d+) of (\d+)', prompt)
+            sec_id = f"sec_{int(sec_idx_m.group(1)):02d}" if sec_idx_m else "sec_01"
+
+            claims = []
+            if eids and "UNRESEARCHED MODE DIRECTIVE" not in prompt:
+                claims.append(
+                    ScriptClaimPayload(
+                        claim_id="clm_01",
+                        claim_text=f"The underlying mechanism in {heading} functions reliably under operational conditions.",
+                        section_id=sec_id,
+                        evidence_ids=[eids[0]],
+                    )
+                )
+
+            return schema(
+                heading=heading,
+                narration=narration,
+                notes=f"Visual staging cues and dynamic 2D animations for {heading}.",
                 claims=claims,
             )
 

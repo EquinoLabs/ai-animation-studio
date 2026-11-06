@@ -13,6 +13,8 @@ from backend.app.domain.research import (
     ChallengeClaimResponse,
     ResearchBriefResponse,
     ResearchOverviewResponse,
+    StartResearchRequest,
+    StartResearchResponse,
 )
 from backend.app.domain.script import ConversationEvent
 from backend.app.services.pipeline.orchestrator import (
@@ -31,6 +33,7 @@ from backend.app.services.pipeline.orchestrator import (
     ScriptStorageError,
     ScriptValidationError,
 )
+from backend.app.services.research.tools.base import MissingCredentialsError
 from backend.app.services.project.service import (
     ProjectError,
     ProjectNotFoundError,
@@ -52,7 +55,7 @@ def get_orchestrator(
     project_service: ProjectService = Depends(get_project_service),
 ) -> PipelineOrchestrator:
     settings = get_settings()
-    return PipelineOrchestrator(
+    return PipelineOrchestrator.create_production(
         project_service=project_service,
         settings=settings,
     )
@@ -73,6 +76,7 @@ class StartScriptRequest(BaseModel):
     title: Optional[str] = Field(default=None, description="Optional preferred script title")
     research_run_id: Optional[str] = Field(default=None, description="Explicit research run ID to ground script")
     allow_unresearched: bool = Field(default=False, description="Explicit authorization to generate without research")
+    auto_research: bool = Field(default=True, description="Whether to automatically run research if project has no existing research runs")
 
 
 class ReviseScriptRequest(BaseModel):
@@ -98,6 +102,8 @@ def _handle_service_errors(exc: Exception) -> None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     if isinstance(exc, (ScriptValidationError, ProjectValidationError, ResearchValidationError)):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    if isinstance(exc, MissingCredentialsError):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     if isinstance(exc, ScriptFinalizationError):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     if isinstance(exc, (ScriptStorageError, ResearchStorageError)):
@@ -203,6 +209,7 @@ def start_script(
             title=req.title,
             research_run_id=req.research_run_id,
             allow_unresearched=req.allow_unresearched,
+            auto_research=req.auto_research,
         )
         workflow_state = orchestrator.get_workflow_state(project_id)
         return ScriptStateResponse(script=script, workflow_state=workflow_state)
@@ -316,8 +323,29 @@ def list_finalized_versions(
 
 
 # ------------------------------------------------------------------------------
-# Research Studio Endpoints (Phase 6)
+# Research Studio Endpoints (Phase 6 & Phase 7)
 # ------------------------------------------------------------------------------
+
+@router.post("/projects/{project_id}/research/start", response_model=StartResearchResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/projects/{project_id}/research", response_model=StartResearchResponse, status_code=status.HTTP_201_CREATED)
+def start_research(
+    project_id: str,
+    req: StartResearchRequest,
+    orchestrator: PipelineOrchestrator = Depends(get_orchestrator),
+) -> StartResearchResponse:
+    """Initiate research planning, tool execution, evidence extraction, and brief compilation."""
+    try:
+        return orchestrator.start_research(
+            project_id=project_id,
+            topic=req.topic,
+            target_duration_minutes=req.target_duration_minutes,
+            user_guidance=req.user_guidance,
+            budget_limits=req.budget_limits,
+        )
+    except Exception as exc:
+        _handle_service_errors(exc)
+        raise
+
 
 @router.get("/projects/{project_id}/research", response_model=ResearchOverviewResponse)
 def get_research_overview(

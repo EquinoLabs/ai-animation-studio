@@ -66,10 +66,39 @@ def compute_duration_word_targets(
     }
 
 
+DurationComplianceStatus = Literal[
+    "compliant",
+    "under_target_evidence_deficit",
+    "under_target_generator_shortfall",
+    "under_target_undetermined",
+]
+
+
+class DurationComplianceReport(BaseModel):
+    """Audited duration metrics, target comparison, and deficit reporting."""
+
+    target_duration_minutes: float = Field(..., description="Target runtime in minutes")
+    target_words: int = Field(..., description="Target word count based on baseline WPM")
+    actual_words: int = Field(..., description="Actual spoken narration word count")
+    min_target_words: int = Field(..., description="Minimum acceptable word count for target duration")
+    max_target_words: int = Field(..., description="Maximum acceptable word count for target duration")
+    deficit_words: int = Field(default=0, description="Word count deficit below minimum target (0 if compliant)")
+    compliance_status: DurationComplianceStatus = Field(
+        default="compliant", description="Audited duration compliance classification"
+    )
+    assessment_note: str = Field(
+        default="", description="Explanatory assessment note on duration compliance and evidence constraints"
+    )
+
+
 def populate_script_duration_metrics(
-    script: "Script", words_per_minute: int = DEFAULT_WORDS_PER_MINUTE
+    script: "Script",
+    words_per_minute: int = DEFAULT_WORDS_PER_MINUTE,
+    evidence_count: Optional[int] = None,
+    evidence_records: Optional[List[Any]] = None,
+    evidence_catalog: Optional[Any] = None,
 ) -> "Script":
-    """Calculate and set target_duration_seconds on sections and estimated duration on the script."""
+    """Calculate and set target_duration_seconds on sections, estimated duration, and duration compliance audit."""
     total_words = 0
     for section in script.sections:
         words = count_words(section.narration)
@@ -77,6 +106,110 @@ def populate_script_duration_metrics(
         section.target_duration_seconds = round(estimate_duration_seconds(words, words_per_minute))
     script.total_word_count = total_words
     script.estimated_duration_seconds = estimate_duration_seconds(total_words, words_per_minute)
+
+    # Duration compliance audit
+    wpm = words_per_minute if words_per_minute > 0 else DEFAULT_WORDS_PER_MINUTE
+    target_words = int(script.target_duration_minutes * wpm)
+    min_words = int(script.target_duration_minutes * 120)
+    max_words = int(script.target_duration_minutes * 150)
+
+    if total_words >= min_words:
+        status: DurationComplianceStatus = "compliant"
+        deficit = 0
+        note = f"Script narration word count ({total_words} words) meets target duration range ({min_words}-{max_words} words)."
+    else:
+        deficit = min_words - total_words
+
+        # Resolve available evidence records from catalog or explicit list
+        records: Optional[List[Any]] = None
+        if evidence_catalog is not None and hasattr(evidence_catalog, "evidence_by_id"):
+            records = list(evidence_catalog.evidence_by_id.values())
+        elif evidence_records is not None:
+            records = list(evidence_records)
+
+        if records is not None:
+            total_records = len(records)
+            distinct_sources = len({getattr(r, "source_id", None) for r in records if getattr(r, "source_id", None)})
+            distinct_queries = len({getattr(r, "query_id", None) for r in records if getattr(r, "query_id", None)})
+            total_excerpt_words = sum(len((getattr(r, "excerpt", "") or "").split()) for r in records)
+            tokens = [w.lower() for r in records for w in re.findall(r"\b[a-zA-Z]{3,}\b", getattr(r, "excerpt", "") or "")]
+            vocab_ratio = (len(set(tokens)) / max(1, len(tokens)))
+
+            if total_records == 0 or total_excerpt_words == 0:
+                status = "under_target_evidence_deficit"
+                note = (
+                    f"Script duration ({total_words} words) is below target {script.target_duration_minutes:.1f} minutes "
+                    f"({min_words}-{max_words} words, deficit: {deficit} words). No usable verified research "
+                    f"evidence was available to sustain the requested duration without introducing ungrounded filler."
+                )
+            elif distinct_sources <= 1 or distinct_queries <= 1 or total_excerpt_words < 60 or vocab_ratio < 0.35:
+                status = "under_target_evidence_deficit"
+                note = (
+                    f"Script duration ({total_words} words) is below target {script.target_duration_minutes:.1f} minutes "
+                    f"({min_words}-{max_words} words, deficit: {deficit} words). Available evidence has limited topic "
+                    f"coverage or repetitive content ({total_records} record(s) across {distinct_sources} source(s) and "
+                    f"{distinct_queries} query coverage, totaling {total_excerpt_words} excerpt words), providing insufficient "
+                    f"diverse material to sustain target duration without ungrounded filler."
+                )
+            elif total_records >= 2 and distinct_sources >= 2 and distinct_queries >= 2 and total_excerpt_words >= 100:
+                status = "under_target_generator_shortfall"
+                note = (
+                    f"Script duration ({total_words} words) is below target {script.target_duration_minutes:.1f} minutes "
+                    f"({min_words}-{max_words} words, deficit: {deficit} words). Adequate substantive research evidence was "
+                    f"available ({total_records} records across {distinct_sources} sources and {distinct_queries} queries, "
+                    f"{total_excerpt_words} excerpt words), but generator produced a concise script without expanding into full target duration."
+                )
+            else:
+                # Borderline evidence (e.g. 2 records from 2 sources but low word count or marginal coverage)
+                status = "under_target_undetermined"
+                note = (
+                    f"Script duration ({total_words} words) is below target {script.target_duration_minutes:.1f} minutes "
+                    f"({min_words}-{max_words} words, deficit: {deficit} words). Evidence coverage ({total_records} records, "
+                    f"{distinct_sources} sources, {total_excerpt_words} words) is borderline, preventing confident attribution "
+                    f"between research evidence constraints and generator brevity."
+                )
+        elif evidence_count is not None:
+            # Fallback when only count is passed without record details
+            if evidence_count <= 1:
+                status = "under_target_evidence_deficit"
+                note = (
+                    f"Script duration ({total_words} words) is below target {script.target_duration_minutes:.1f} minutes "
+                    f"({min_words}-{max_words} words, deficit: {deficit} words). Verified research evidence count "
+                    f"({evidence_count}) is insufficient to sustain the requested duration without introducing ungrounded filler."
+                )
+            elif evidence_count >= 5 and total_words < (0.6 * min_words):
+                status = "under_target_generator_shortfall"
+                note = (
+                    f"Script duration ({total_words} words) is below target {script.target_duration_minutes:.1f} minutes "
+                    f"({min_words}-{max_words} words, deficit: {deficit} words). Model generated concise narrative "
+                    f"despite {evidence_count} catalog evidence items."
+                )
+            else:
+                status = "under_target_undetermined"
+                note = (
+                    f"Script duration ({total_words} words) is below target {script.target_duration_minutes:.1f} minutes "
+                    f"({min_words}-{max_words} words, deficit: {deficit} words). Available evidence count ({evidence_count}) "
+                    f"without content/coverage inspection is insufficient to definitively distinguish evidence deficit from generator shortfall."
+                )
+        else:
+            # Neither records nor count provided: honest uncertainty
+            status = "under_target_undetermined"
+            note = (
+                f"Script duration ({total_words} words) is below target {script.target_duration_minutes:.1f} minutes "
+                f"({min_words}-{max_words} words, deficit: {deficit} words). Insufficient research metadata available "
+                f"to determine whether deficit stems from research constraints or generator brevity."
+            )
+
+    script.duration_compliance = DurationComplianceReport(
+        target_duration_minutes=script.target_duration_minutes,
+        target_words=target_words,
+        actual_words=total_words,
+        min_target_words=min_words,
+        max_target_words=max_words,
+        deficit_words=deficit,
+        compliance_status=status,
+        assessment_note=note,
+    )
     return script
 
 
@@ -310,6 +443,13 @@ class OutlineSectionPayload(BaseModel):
             raise ValueError("Outline section heading cannot be empty or blank.")
         return clean
 
+    @field_validator("evidence_ids", mode="before")
+    @classmethod
+    def coerce_evidence_ids(cls, v: Any) -> Any:
+        if isinstance(v, list):
+            return [str(item) for item in v if item is not None and str(item).strip()]
+        return v
+
 
 class GeneratedOutlinePayload(BaseModel):
     """Structured narrative outline payload returned by the LLM."""
@@ -336,7 +476,7 @@ class ScriptClaimPayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     claim_text: str = Field(..., min_length=1, description="Factual assertion made in narration")
-    section_id: str = Field(..., min_length=1, description="Target section id (e.g., sec_01)")
+    section_id: Optional[str] = Field(default=None, description="Target section id (e.g., sec_01)")
     evidence_ids: List[str] = Field(default_factory=list, description="Referenced evidence record IDs from catalog")
 
     @field_validator("claim_text")
@@ -349,11 +489,18 @@ class ScriptClaimPayload(BaseModel):
 
     @field_validator("section_id")
     @classmethod
-    def validate_section_id(cls, v: str) -> str:
+    def validate_section_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
         clean = (v or "").strip()
-        if not clean:
-            raise ValueError("section_id cannot be empty or blank.")
-        return clean
+        return clean or None
+
+    @field_validator("evidence_ids", mode="before")
+    @classmethod
+    def coerce_evidence_ids(cls, v: Any) -> Any:
+        if isinstance(v, list):
+            return [str(item) for item in v if item is not None and str(item).strip()]
+        return v
 
 
 class ScriptSectionPayload(BaseModel):
@@ -391,12 +538,22 @@ class GeneratedScriptPayload(BaseModel):
     sections: List[ScriptSectionPayload] = Field(..., min_length=1, description="Generated script sections")
     claims: List[ScriptClaimPayload] = Field(default_factory=list, description="Declared factual claims")
 
-    @field_validator("title")
+
+class GeneratedSectionPayload(BaseModel):
+    """Container payload emitted when generating or expanding an individual script section."""
+    model_config = ConfigDict(extra="ignore")
+
+    heading: str = Field(..., min_length=1, description="Section heading")
+    narration: str = Field(..., min_length=1, description="Spoken voiceover narration")
+    notes: Optional[str] = Field(None, description="2D animation visual staging cues")
+    claims: List[ScriptClaimPayload] = Field(default_factory=list, description="Factual claims declared in this section")
+
+    @field_validator("heading", "narration")
     @classmethod
-    def validate_title(cls, v: str) -> str:
+    def validate_non_empty(cls, v: str) -> str:
         clean = (v or "").strip()
         if not clean:
-            raise ValueError("title cannot be empty or blank.")
+            raise ValueError("Field cannot be empty or blank.")
         return clean
 
 
@@ -483,6 +640,9 @@ class Script(BaseModel):
     )
     outline: Optional[ScriptOutline] = Field(
         default=None, description="Optional narrative outline used to structure this script"
+    )
+    duration_compliance: Optional[DurationComplianceReport] = Field(
+        default=None, description="Optional audited duration metrics, target comparison, and deficit reporting"
     )
 
     @field_validator("title")

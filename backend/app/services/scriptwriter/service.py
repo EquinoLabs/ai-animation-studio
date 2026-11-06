@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import re
 import string
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -597,6 +597,7 @@ class ScriptService:
         research_run_id: Optional[str] = None,
         allow_unresearched: bool = False,
         outline: Optional[ScriptOutline] = None,
+        generation_mode: Optional[Literal["section_by_section", "monolithic"]] = None,
     ) -> Script:
         """Generate an initial structured Script draft from a topic using the approved roadmap pipeline.
 
@@ -651,12 +652,15 @@ class ScriptService:
 
         # 3. Generate Script draft from outline
         try:
-            draft_input = DraftGeneratorInput(
-                project_id=project_id,
-                outline=active_outline,
-                allow_unresearched=allow_unresearched,
-                title=title,
-            )
+            draft_kwargs: Dict[str, Any] = {
+                "project_id": project_id,
+                "outline": active_outline,
+                "allow_unresearched": allow_unresearched,
+                "title": title,
+            }
+            if generation_mode is not None:
+                draft_kwargs["generation_mode"] = generation_mode
+            draft_input = DraftGeneratorInput(**draft_kwargs)
             generated = self.generator.generate_draft(draft_input)
         except (ScriptDraftSecurityError, ScriptDraftRunError) as run_err:
             raise ScriptValidationError(f"Cannot generate draft: {run_err}") from run_err
@@ -673,11 +677,11 @@ class ScriptService:
         generated.project_id = project_id
         generated.status = "draft"
         generated.updated_at = utc_now()
-        populate_script_duration_metrics(generated, words_per_minute=self.words_per_minute)
 
         # 4. Automatic Fact-Checking of initial draft
         is_researched, evidence_catalog = self._resolve_revision_catalog(project_id, generated)
         catalog = evidence_catalog if is_researched else None
+        populate_script_duration_metrics(generated, words_per_minute=self.words_per_minute, evidence_catalog=catalog)
 
         initial_report = self.fact_checker.check_script(
             script=generated,
@@ -732,7 +736,7 @@ class ScriptService:
                 repaired.project_id = project_id
                 repaired.status = "draft"
                 repaired.updated_at = utc_now()
-                populate_script_duration_metrics(repaired, words_per_minute=self.words_per_minute)
+                populate_script_duration_metrics(repaired, words_per_minute=self.words_per_minute, evidence_catalog=catalog)
 
                 repair_report = repair_result.fact_check_report
                 repair_report.script_version = v2
@@ -1177,7 +1181,7 @@ class ScriptService:
                 repaired.project_id = project_id
                 repaired.status = "draft"
                 repaired.updated_at = utc_now()
-                populate_script_duration_metrics(repaired, words_per_minute=self.words_per_minute)
+                populate_script_duration_metrics(repaired, words_per_minute=self.words_per_minute, evidence_catalog=catalog)
 
                 repair_report = repair_result.fact_check_report
                 repair_report.script_version = v_rep
@@ -1647,9 +1651,8 @@ class ScriptService:
             revised_script.sections = updated_sections
             revised_script.claims = updated_claims
             revised_script.updated_at = utc_now()
-            populate_script_duration_metrics(revised_script, words_per_minute=self.words_per_minute)
-
             rev_catalog = evidence_catalog if is_researched else None
+            populate_script_duration_metrics(revised_script, words_per_minute=self.words_per_minute, evidence_catalog=rev_catalog)
             rev_report = self.fact_checker.check_script(
                 script=revised_script,
                 catalog=rev_catalog,

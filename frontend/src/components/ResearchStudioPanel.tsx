@@ -8,7 +8,9 @@ import { ResearchBriefModal } from './ResearchBriefModal';
 
 interface ResearchStudioPanelProps {
   projectId: string;
+  projectTitle?: string;
   currentScriptVersion?: number;
+  onResearchCompleted?: () => void;
 }
 
 type StudioTab = 'evidence' | 'queries' | 'sources' | 'assessments';
@@ -17,7 +19,9 @@ type QueryFilter = 'all' | 'completed' | 'planned' | 'skipped' | 'failed';
 
 export const ResearchStudioPanel: React.FC<ResearchStudioPanelProps> = ({
   projectId,
+  projectTitle,
   currentScriptVersion,
+  onResearchCompleted,
 }) => {
   const [overview, setOverview] = useState<ResearchOverviewResponse | null>(null);
   const [report, setReport] = useState<ScriptFactCheckReport | null>(null);
@@ -26,12 +30,49 @@ export const ResearchStudioPanel: React.FC<ResearchStudioPanelProps> = ({
   const [activeTab, setActiveTab] = useState<StudioTab>('evidence');
   const [showBriefModal, setShowBriefModal] = useState<boolean>(false);
 
+  // Automated Research initiation state
+  const [researchTopic, setResearchTopic] = useState<string>(projectTitle || '');
+  const [researching, setResearching] = useState<boolean>(false);
+  const [initError, setInitError] = useState<string | null>(null);
+  const [showStartForm, setShowStartForm] = useState<boolean>(false);
+
   // Evidence filtering & search
   const [evidenceFilter, setEvidenceFilter] = useState<EvidenceFilter>('all');
   const [evidenceSearch, setEvidenceSearch] = useState<string>('');
 
   // Query lifecycle filtering
   const [queryFilter, setQueryFilter] = useState<QueryFilter>('all');
+
+  useEffect(() => {
+    if (projectTitle && !researchTopic) {
+      setResearchTopic(projectTitle);
+    }
+  }, [projectTitle]);
+
+  const handleInitiateResearch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!researchTopic.trim() || researching) return;
+    setResearching(true);
+    setInitError(null);
+    try {
+      const res = await api.startResearch(projectId, { topic: researchTopic.trim() });
+      setOverview(res.overview);
+      try {
+        const repRes = await api.getFactCheckReport(projectId, currentScriptVersion);
+        setReport(repRes);
+      } catch {
+        setReport(null);
+      }
+      setShowStartForm(false);
+      if (onResearchCompleted) {
+        onResearchCompleted();
+      }
+    } catch (err) {
+      setInitError(err instanceof ApiError ? err.detail : 'Failed to execute research pipeline.');
+    } finally {
+      setResearching(false);
+    }
+  };
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -166,6 +207,54 @@ export const ResearchStudioPanel: React.FC<ResearchStudioPanelProps> = ({
           This project has not completed an automated research cycle yet. When you generate a research-grounded script draft,
           the system will execute queries, extract source facts, record evidence excerpts, and ground all claims here.
         </p>
+
+        {/* Clean Research Initiation Form */}
+        <form
+          onSubmit={handleInitiateResearch}
+          style={{
+            margin: '1.5rem auto',
+            maxWidth: '480px',
+            textAlign: 'left',
+            backgroundColor: 'var(--bg-secondary)',
+            padding: '1.25rem',
+            borderRadius: 'var(--radius-md)',
+            border: '1px solid var(--border-color)',
+          }}
+        >
+          <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-primary)', marginBottom: '0.4rem' }}>
+            Investigate Topic:
+          </label>
+          <input
+            type="text"
+            className="form-input"
+            value={researchTopic}
+            onChange={(e) => setResearchTopic(e.target.value)}
+            placeholder="Enter research topic..."
+            disabled={researching}
+            style={{ width: '100%', marginBottom: '0.75rem', padding: '0.5rem 0.75rem' }}
+            required
+          />
+          {initError && (
+            <div className="banner banner-error" style={{ marginBottom: '0.75rem', fontSize: '0.825rem' }}>
+              <span>⚠️ {initError}</span>
+            </div>
+          )}
+          <button
+            type="submit"
+            className="btn-primary"
+            disabled={researching || !researchTopic.trim()}
+            style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}
+          >
+            {researching ? (
+              <>
+                <div className="spinner-sm" /> Running Research Pipeline...
+              </>
+            ) : (
+              '🚀 Start Automated Research'
+            )}
+          </button>
+        </form>
+
         <div className="banner banner-info" style={{ textAlign: 'left', fontSize: '0.85rem' }}>
           <span>💡 <strong>Tip:</strong> Head over to the Script Workspace to create or revise a draft with automated research grounding.</span>
         </div>
@@ -209,6 +298,14 @@ export const ResearchStudioPanel: React.FC<ResearchStudioPanelProps> = ({
           <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'center' }}>
             <button
               type="button"
+              className="btn-primary"
+              onClick={() => setShowStartForm(!showStartForm)}
+              style={{ fontSize: '0.8rem', padding: '0.45rem 0.85rem' }}
+            >
+              {showStartForm ? '✕ Close Form' : '🔍 Run Research'}
+            </button>
+            <button
+              type="button"
               className="btn-secondary"
               onClick={() => setShowBriefModal(true)}
               style={{ fontSize: '0.8rem', padding: '0.45rem 0.85rem' }}
@@ -227,6 +324,55 @@ export const ResearchStudioPanel: React.FC<ResearchStudioPanelProps> = ({
             </button>
           </div>
         </div>
+
+        {/* Optional Collapsible Research Form */}
+        {showStartForm && (
+          <form
+            onSubmit={handleInitiateResearch}
+            style={{
+              marginTop: '1rem',
+              padding: '1rem',
+              borderRadius: 'var(--radius-sm)',
+              backgroundColor: 'var(--bg-primary)',
+              border: '1px solid var(--border-color)',
+            }}
+          >
+            <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-primary)', marginBottom: '0.4rem' }}>
+              Investigate New Topic:
+            </label>
+            <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+              <input
+                type="text"
+                className="form-input"
+                value={researchTopic}
+                onChange={(e) => setResearchTopic(e.target.value)}
+                placeholder="Enter topic..."
+                disabled={researching}
+                style={{ flex: 1, minWidth: '240px', padding: '0.45rem 0.75rem' }}
+                required
+              />
+              <button
+                type="submit"
+                className="btn-primary"
+                disabled={researching || !researchTopic.trim()}
+                style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}
+              >
+                {researching ? (
+                  <>
+                    <div className="spinner-sm" /> Running...
+                  </>
+                ) : (
+                  '🚀 Start Run'
+                )}
+              </button>
+            </div>
+            {initError && (
+              <div className="banner banner-error" style={{ marginTop: '0.5rem', fontSize: '0.825rem' }}>
+                <span>⚠️ {initError}</span>
+              </div>
+            )}
+          </form>
+        )}
 
         {/* Objective Truth & Recheck Disclaimer Notice */}
         <div
@@ -886,7 +1032,7 @@ export const ResearchStudioPanel: React.FC<ResearchStudioPanelProps> = ({
                   <div>
                     <h3 style={{ fontSize: '1.1rem', fontWeight: 600 }}>Fact-Check Report (Version {report.script_version})</h3>
                     <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                      Evaluated on {new Date(report.checked_at).toLocaleString()}
+                      Evaluated on {new Date(report.created_at || report.checked_at || Date.now()).toLocaleString()}
                     </p>
                   </div>
                   <span
@@ -907,29 +1053,33 @@ export const ResearchStudioPanel: React.FC<ResearchStudioPanelProps> = ({
                 >
                   <div className="metric-box">
                     <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>Total Claims</span>
-                    <div style={{ fontSize: '1.1rem', fontWeight: 600 }}>{report.summary.total_claims}</div>
+                    <div style={{ fontSize: '1.1rem', fontWeight: 600 }}>
+                      {report.total_claims ?? report.summary?.total_claims ?? report.assessments.length}
+                    </div>
                   </div>
                   <div className="metric-box">
                     <span style={{ fontSize: '0.7rem', color: 'var(--accent-green)' }}>Supported</span>
                     <div style={{ fontSize: '1.1rem', fontWeight: 600, color: 'var(--accent-green)' }}>
-                      {report.summary.supported}
+                      {report.supported_count ?? report.summary?.supported ?? 0}
                     </div>
                   </div>
                   <div className="metric-box">
                     <span style={{ fontSize: '0.7rem', color: 'var(--accent-rose)' }}>Contradicted</span>
                     <div style={{ fontSize: '1.1rem', fontWeight: 600, color: 'var(--accent-rose)' }}>
-                      {report.summary.contradicted}
+                      {report.contradicted_count ?? report.summary?.contradicted ?? 0}
                     </div>
                   </div>
                   <div className="metric-box">
                     <span style={{ fontSize: '0.7rem', color: 'var(--accent-amber)' }}>Conflicting</span>
                     <div style={{ fontSize: '1.1rem', fontWeight: 600, color: 'var(--accent-amber)' }}>
-                      {report.summary.conflicting}
+                      {report.conflicting_count ?? report.summary?.conflicting ?? 0}
                     </div>
                   </div>
                   <div className="metric-box">
-                    <span style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>Unassessed</span>
-                    <div style={{ fontSize: '1.1rem', fontWeight: 600 }}>{report.summary.unassessed}</div>
+                    <span style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>Unassessed / Not Checked</span>
+                    <div style={{ fontSize: '1.1rem', fontWeight: 600 }}>
+                      {report.not_checked_count ?? report.unsupported_count ?? report.summary?.unassessed ?? 0}
+                    </div>
                   </div>
                 </div>
               </div>

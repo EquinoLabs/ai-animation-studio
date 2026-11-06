@@ -115,37 +115,246 @@ def normalize_url_for_dedupe(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Verbatim Evidence Extraction Helper
+# Quality Filters and Substantive Evidence Extraction
 # ---------------------------------------------------------------------------
+
+GATEKEEPER_CHALLENGE_PATTERNS = [
+    re.compile(r"\bcookies?\s+must\s+be\s+enabled\b", re.IGNORECASE),
+    re.compile(r"\benable\s+cookies?\b", re.IGNORECASE),
+    re.compile(r"\benable\s+javascript\b", re.IGNORECASE),
+    re.compile(r"\bturn\s+on\s+javascript\b", re.IGNORECASE),
+    re.compile(r"\bjavascript\s+is\s+disabled\b", re.IGNORECASE),
+    re.compile(r"\battention\s+required!?\s*\|\s*cloudflare\b", re.IGNORECASE),
+    re.compile(r"\bverify\s+you\s+are\s+(a\s+)?human\b", re.IGNORECASE),
+    re.compile(r"\brobot\s+or\s+human\b", re.IGNORECASE),
+    re.compile(r"\baccess\s+denied\b", re.IGNORECASE),
+    re.compile(r"\b403\s+forbidden\b", re.IGNORECASE),
+    re.compile(r"\bcf-chl-bypass\b", re.IGNORECASE),
+    re.compile(r"\bsecurity\s+service\s+to\s+protect\s+itself\s+from\s+online\s+attacks\b", re.IGNORECASE),
+    re.compile(r"\bray\s+id:\s*[a-f0-9]+\b", re.IGNORECASE),
+    re.compile(r"\bjust\s+a\s+moment\b", re.IGNORECASE),
+]
+
+DISALLOWED_HEADING_KEYWORDS = {
+    "cookie",
+    "cookies",
+    "privacy policy",
+    "terms of service",
+    "terms of use",
+    "menu",
+    "navigation",
+    "footer",
+    "advertisement",
+    "sponsored",
+    "subscribe",
+    "sign in",
+    "login",
+    "share this",
+    "related articles",
+    "table of contents",
+    "comments",
+}
+
+
+def is_challenge_or_gatekeeper(text: str) -> bool:
+    """Detect bot challenges, cookie gates, and access-denied pages."""
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in GATEKEEPER_CHALLENGE_PATTERNS)
+
+
+def is_navigation_or_chrome(text: str) -> bool:
+    """Detect navigation lists, breadcrumbs, link-heavy chrome, and table of contents."""
+    if not text or not text.strip():
+        return True
+    stripped = text.strip()
+
+    # Markdown links: [anchor](url)
+    link_matches = re.findall(r"\[([^\]]+)\]\(([^)]+)\)", stripped)
+    if not link_matches:
+        return False
+
+    link_chars = sum(len(m[0]) + len(m[1]) + 4 for m in link_matches)
+    link_ratio = link_chars / max(1, len(stripped))
+
+    # If links constitute >35% of the block, or block has >= 3 links with under 20 total non-link words
+    words = [w for w in re.sub(r"\[([^\]]+)\]\(([^)]+)\)", "", stripped).split() if w.strip()]
+    if link_ratio > 0.35:
+        return True
+    if len(link_matches) >= 3 and len(words) < 20:
+        return True
+    if re.search(r"\b(home|about|contact|privacy|terms|login|sign up)\b", stripped, re.IGNORECASE) and link_ratio > 0.25:
+        return True
+
+    return False
+
+
+def is_byline_or_metadata(text: str) -> bool:
+    """Detect image cards, author bylines, reading-time badges, and publication metadata without prose."""
+    if not text or not text.strip():
+        return True
+    stripped = text.strip()
+
+    # If the text is purely an image tag
+    if re.fullmatch(r"!\[[^\]]*\]\([^)]+\)", stripped):
+        return True
+
+    # Strip image tags
+    cleaned = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", stripped).strip()
+    if not cleaned:
+        return True
+
+    # Byline / reading-time / views patterns
+    if re.search(r"\b(\d+\s*min\s+read|\d+\s*views?|ai\s+generated|photo\s+by|published\s+on)\b", cleaned, re.IGNORECASE):
+        words = cleaned.split()
+        if len(words) < 20:
+            return True
+
+    return False
+
+
+def score_candidate_paragraph(paragraph: str, current_heading: Optional[str]) -> float:
+    """Score a candidate markdown paragraph for substantive educational evidence quality.
+
+    Returns a score > 0 for valid substantive passages, or <= 0 for invalid/chrome/gatekeeper blocks.
+    """
+    stripped = paragraph.strip()
+    if not stripped:
+        return -100.0
+
+    # 1. Gatekeeper / challenge check
+    if is_challenge_or_gatekeeper(stripped):
+        return -200.0
+
+    # 2. Heading quality penalty
+    if current_heading:
+        h_lower = current_heading.lower().strip()
+        if any(bad in h_lower for bad in DISALLOWED_HEADING_KEYWORDS):
+            return -100.0
+
+    # 3. Navigation / chrome check
+    if is_navigation_or_chrome(stripped):
+        return -100.0
+
+    # 4. Byline / metadata check
+    if is_byline_or_metadata(stripped):
+        return -100.0
+
+    # Clean images from paragraph for word/sentence evaluation
+    text_content = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", stripped).strip()
+    words = text_content.split()
+    word_count = len(words)
+
+    # Legitimate short substantive definitions or passages are allowed,
+    # but fragments (< 4 words) are rejected.
+    if word_count < 4:
+        return -50.0
+
+    # Must contain terminal sentence punctuation (. ? !)
+    if not re.search(r"[.?!]", text_content):
+        return -30.0
+
+    # Short passages (< 15 words) without terminal punctuation are subtitles/metadata fragments
+    if word_count < 15 and not text_content.endswith((".", "?", "!", '"', "'", "”")):
+        return -30.0
+
+    # Must contain at least one complete sentence
+    sentences = [s.strip() for s in re.split(r"[.?!]", text_content) if s.strip()]
+    valid_sentences = [s for s in sentences if len(s.split()) >= 3]
+    if not valid_sentences:
+        return -30.0
+
+    score = 10.0
+
+    # Ideal length bonus (30 to 150 words)
+    if 30 <= word_count <= 150:
+        score += 25.0
+    elif 15 <= word_count < 30:
+        # Legitimate concise definitions
+        score += 15.0
+    elif 150 < word_count <= 300:
+        score += 20.0
+    else:
+        score += 5.0
+
+    # Terminal punctuation bonus
+    if stripped.endswith((".", "?", "!")):
+        score += 5.0
+
+    # Complexity / substantive prose bonus: presence of lowercase and uppercase words, standard punctuation
+    commas = text_content.count(",")
+    score += min(5.0, commas * 1.0)
+
+    return score
+
 
 def extract_verbatim_evidence(
     content: str, max_chars: int = 1000
-) -> Tuple[str, str]:
-    """Extract a non-empty, bounded verbatim passage and structural locator from markdown content."""
-    lines = content.splitlines()
+) -> Tuple[Optional[str], Optional[str]]:
+    """Extract a non-empty, substantive verbatim passage and structural locator from markdown content.
+
+    Rejects cookie/bot challenges, navigation chrome, bylines, and boilerplate.
+    Returns (None, None) if no substantive passage passes quality thresholds.
+    """
+    if not content or not content.strip():
+        return None, None
+
+    cleaned_content = content.strip()
+
+    # Fast-reject whole page if short (< 500 chars) and dominated by challenge signatures
+    if len(cleaned_content) < 500 and is_challenge_or_gatekeeper(cleaned_content):
+        return None, None
+
+    lines = cleaned_content.splitlines()
     current_heading: Optional[str] = None
-    target_paragraph: List[str] = []
+    candidate_paragraphs: List[Tuple[str, Optional[str]]] = []  # (paragraph_text, heading)
+    current_block: List[str] = []
 
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("#"):
-            if not target_paragraph:
-                current_heading = stripped.lstrip("#").strip()
-            else:
-                break
-        elif stripped:
-            target_paragraph.append(stripped)
-            if sum(len(p) for p in target_paragraph) >= 200:
-                break
+            if current_block:
+                block_text = " ".join(current_block).strip()
+                if block_text:
+                    candidate_paragraphs.append((block_text, current_heading))
+                current_block = []
+            current_heading = stripped.lstrip("#").strip()
+        elif not stripped:
+            if current_block:
+                block_text = " ".join(current_block).strip()
+                if block_text:
+                    candidate_paragraphs.append((block_text, current_heading))
+                current_block = []
+        else:
+            current_block.append(stripped)
 
-    if target_paragraph:
-        passage = " ".join(target_paragraph)
-    else:
-        passage = content.strip()
+    if current_block:
+        block_text = " ".join(current_block).strip()
+        if block_text:
+            candidate_paragraphs.append((block_text, current_heading))
 
-    excerpt = passage[:max_chars].strip()
-    locator = f"heading: '{current_heading}'" if current_heading else "section: main"
-    return excerpt, locator
+    # Score each candidate paragraph
+    best_paragraph: Optional[str] = None
+    best_heading: Optional[str] = None
+    best_score: float = 0.0
+
+    for para_text, heading in candidate_paragraphs:
+        score = score_candidate_paragraph(para_text, heading)
+        if score > best_score:
+            best_score = score
+            best_paragraph = para_text
+            best_heading = heading
+
+    if best_paragraph and best_score > 0.0:
+        # Clean any remaining image markdown from excerpt
+        clean_excerpt = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", best_paragraph).strip()
+        # Clean excessive internal spaces
+        clean_excerpt = re.sub(r"\s+", " ", clean_excerpt)
+        excerpt = clean_excerpt[:max_chars].strip()
+        locator = f"heading: '{best_heading}'" if best_heading else "section: main"
+        return excerpt, locator
+
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +456,7 @@ class ResearchOrchestrator:
         seen_canonical_urls: Set[str] = set()
         source_to_query_map: Dict[str, str] = {}  # source_id -> query_id
         source_to_target_question: Dict[str, Optional[str]] = {}  # source_id -> target_question
+        query_sources: Dict[str, List[SourceRecord]] = {q.query_id: [] for q in plan.planned_queries}
 
         search_budget_exhausted = False
         search_deadline_exhausted = False
@@ -351,8 +561,10 @@ class ResearchOrchestrator:
                 # Deduplicate: if already seen in this project/run, reference existing source
                 if canonical in seen_canonical_urls:
                     existing = next((s for s in discovered_sources if s.canonical_url == canonical), None)
-                    if existing and existing.source_id not in returned_source_ids:
-                        returned_source_ids.append(existing.source_id)
+                    if existing:
+                        if existing.source_id not in returned_source_ids:
+                            returned_source_ids.append(existing.source_id)
+                        query_sources[query.query_id].append(existing)
                     continue
 
                 seen_canonical_urls.add(canonical)
@@ -373,6 +585,7 @@ class ResearchOrchestrator:
                 try:
                     saved_source = self.storage_service.save_source(project_id, source_rec)
                     discovered_sources.append(saved_source)
+                    query_sources[query.query_id].append(saved_source)
                     returned_source_ids.append(saved_source.source_id)
                     source_to_query_map[saved_source.source_id] = query.query_id
                     source_to_target_question[saved_source.source_id] = query.target_question
@@ -406,8 +619,28 @@ class ResearchOrchestrator:
         extract_deadline_exhausted = False
         extract_budget_exhausted = False
 
-        # Candidate selection: iterate deterministically over discovered sources
-        for source in discovered_sources:
+        # Deterministic Round-Robin Extraction Scheduling across planned queries
+        extraction_queue: List[Tuple[SourceRecord, str]] = []  # (source, query_id)
+        max_depth = max((len(srcs) for srcs in query_sources.values()), default=0)
+        queued_source_ids: Set[str] = set()
+
+        for depth in range(max_depth):
+            for q_def in plan.planned_queries:
+                q_srcs = query_sources.get(q_def.query_id, [])
+                if depth < len(q_srcs):
+                    cand_src = q_srcs[depth]
+                    if cand_src.source_id not in queued_source_ids:
+                        queued_source_ids.add(cand_src.source_id)
+                        extraction_queue.append((cand_src, q_def.query_id))
+
+        if not extraction_queue:
+            for s in discovered_sources:
+                if s.source_id not in queued_source_ids:
+                    queued_source_ids.add(s.source_id)
+                    extraction_queue.append((s, source_to_query_map.get(s.source_id, "")))
+
+        # Candidate selection: iterate deterministically over scheduled extraction queue
+        for source, executing_qid in extraction_queue:
             # Check deadline before extraction
             if session.remaining_seconds() <= 0:
                 extract_deadline_exhausted = True
@@ -477,12 +710,25 @@ class ResearchOrchestrator:
 
             # Extract bounded verbatim excerpt and structural locator
             excerpt, locator = extract_verbatim_evidence(content_text, max_chars=1000)
-            if not excerpt:
+            if not excerpt or not excerpt.strip():
+                logger.info(
+                    "Extraction from '%s' yielded no substantive article content (rejected chrome/boilerplate).",
+                    source.url,
+                )
+                unavail_source = source.model_copy(update={"retrieval_status": "unavailable"})
+                try:
+                    self.storage_service.save_source(project_id, unavail_source)
+                except Exception as err:
+                    self._handle_persistence_failure(project_id, run, f"Failed to update unavailable source: {err}")
                 continue
 
             # Retrieve associated inquiry question target (never a fabricated factual claim)
-            inquiry_target = source_to_target_question.get(source.source_id) or "General Inquiry"
-            associated_qid = source_to_query_map.get(source.source_id)
+            associated_qid = executing_qid or source_to_query_map.get(source.source_id)
+            target_question = next(
+                (q.target_question for q in plan.planned_queries if q.query_id == associated_qid),
+                source_to_target_question.get(source.source_id) or "General Inquiry",
+            )
+            inquiry_target = target_question or "General Inquiry"
 
             evidence_rec = EvidenceRecord(
                 evidence_id=f"evi_{uuid.uuid4().hex[:12]}",

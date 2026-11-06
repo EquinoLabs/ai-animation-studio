@@ -117,3 +117,42 @@ def test_cli_json_output_mode(cli_projects_dir, capsys):
     parsed = json.loads(out)
     assert parsed["project_id"] == "proj_json_01"
     assert parsed["title"] == "JSON Project"
+
+
+def test_cli_aliases(cli_projects_dir, capsys):
+    """Verify --script-writing and --scene-builder aliases behave identically to primary flags."""
+    # 1. Create project
+    run_cli(["--new-project", "--title", "Alias Project", "--project", "proj_alias", "--projects-dir", str(cli_projects_dir)])
+    capsys.readouterr()
+
+    # 2. --script-writing requires --project
+    code_no_proj = run_cli(["--script-writing", "--projects-dir", str(cli_projects_dir)])
+    assert code_no_proj == 2
+    _, err_no_proj = capsys.readouterr()
+    assert "requires --project" in err_no_proj
+
+    # 3. --scene-builder checks prerequisites
+    code_scene = run_cli(["--scene-builder", "--project", "proj_alias", "--projects-dir", str(cli_projects_dir)])
+    assert code_scene == 1
+    _, err_scene = capsys.readouterr()
+    assert "Prerequisite not met for 'plan-scenes'" in err_scene
+
+
+def test_root_main_delegates_to_cli(cli_projects_dir):
+    """Verify root main.py correctly executes and forwards CLI arguments."""
+    import subprocess
+    import sys
+
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    main_py = repo_root / "main.py"
+    assert main_py.exists(), "Root main.py must exist"
+
+    # Run list-projects through root main.py
+    proc = subprocess.run(
+        [sys.executable, str(main_py), "--list-projects", "--projects-dir", str(cli_projects_dir)],
+        capture_output=True,
+        text=True,
+        cwd=str(repo_root),
+    )
+    assert proc.returncode == 0
+    assert "Found" in proc.stdout or "No projects found" in proc.stdout

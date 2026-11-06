@@ -20,6 +20,7 @@ from backend.app.services.research.tools.base import (
     sanitize_secret,
     validate_url_safety,
 )
+from backend.app.services.research.tools.factory import ResearchToolFactory
 from backend.app.services.research.tools.firecrawl import (
     FirecrawlExtractArgs,
     FirecrawlExtractTool,
@@ -47,6 +48,7 @@ __all__ = [
     "ResearchTimeoutError",
     "ResearchTool",
     "ResearchToolError",
+    "ResearchToolFactory",
     "SearchResultItem",
     "SearchToolResult",
     "TavilySearchArgs",

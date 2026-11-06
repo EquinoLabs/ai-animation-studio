@@ -297,6 +297,13 @@ class ScriptOutliner:
                 raise ScriptOutlinerRunError(
                     f"Explicit research run '{explicit_run_id}' has status '{run.status}'; only 'completed' runs can ground outlines."
                 )
+            evidence_items = self.research_storage.list_evidence(project_id, run_id=run.run_id)
+            scoped_evidence = [ev for ev in evidence_items if ev.run_id == run.run_id]
+            if not scoped_evidence:
+                raise ScriptOutlinerRunError(
+                    f"Explicit research run '{explicit_run_id}' contains 0 evidence records scoped to its run ID. "
+                    f"Only runs with retrieved evidence can ground outlines."
+                )
             return run
 
         if not explicit_run_id and allow_unresearched:
@@ -317,6 +324,14 @@ class ScriptOutliner:
             raise ScriptOutlinerRunError(
                 f"Newest research run '{newest_run.run_id}' has status '{newest_run.status}' (started: {newest_run.started_at.isoformat()}). "
                 f"Cannot ground outline: incomplete or failed runs are rejected and cannot fall back to older runs."
+            )
+
+        evidence_items = self.research_storage.list_evidence(project_id, run_id=newest_run.run_id)
+        scoped_evidence = [ev for ev in evidence_items if ev.run_id == newest_run.run_id]
+        if not scoped_evidence:
+            raise ScriptOutlinerRunError(
+                f"Newest research run '{newest_run.run_id}' contains 0 evidence records scoped to its run ID. "
+                f"Cannot ground outline without retrieved evidence."
             )
 
         return newest_run

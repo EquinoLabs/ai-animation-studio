@@ -119,4 +119,79 @@ The Research Studio UI is integrated seamlessly into the main workspace via top-
 ### 3.3 Robustness & Safety Guarantees
 1. **Empty States**: Projects without research data render a dedicated empty state explaining the research cycle and guiding the user to generate a draft.
 2. **Missing Reports**: Handles absent fact-check reports without throwing errors or displaying misleading data.
-3. **Boundary Protection**: Does not implement claim badges, claim drawers, or conversational fact-challenge controls in the script view (reserved for Checkpoint 3).
+3. **Boundary Protection**: Checkpoint 2 focused strictly on the Research Studio UI panel. Claim annotations and conversational challenges are implemented in Checkpoint 3 below.
+
+---
+
+## 4. Checkpoint 3: Script Claim Annotations, Inspection Modal & Conversational Fact Challenges
+
+### 4.1 Script Claim Annotations (`ScriptViewer.tsx`)
+1. **Paragraph Highlighting Boundary**:
+   - Section narration retains clean, natural typography without blanket background highlighting that could falsely imply an entire passage is certified true when only a subset of assertions was verified.
+   - Discrete **Claim Cards** are rendered under each section narration block in a dedicated *"⚖️ Factual Claims & Evidence Linkage"* container.
+2. **Discrete Claim Badges**:
+   - **Claim ID**: Formatted distinctly with monospace identifier tags (e.g., `[clm_01]`).
+   - **Assessment Status**: Visual indicator pills for `Supported`, `Partially Supported`, `Contradicted`, `Conflicting`, `Unsupported`, and `Not Checked`.
+   - **Risk Level Tags**: Prominently highlights `HIGH RISK` and `CREATIVE FLEXIBILITY` assertions with dedicated scrutiny badges while treating `NORMAL` as standard scrutiny, matching the accepted Phase 5 domain contract (`high`, `normal`, `creative_flexibility`).
+   - **Evidence Linkage Count**: Displays cited evidence items count (`🔗 N evidence items linked`).
+   - **Unassessed Claims**: Safely rendered with neutral styling and explicit `"Not Checked"` status when reports are absent or claims are unverified.
+
+### 4.2 Claim Detail Inspection Modal (`ClaimInspectionModal.tsx`)
+1. **Proposition & Assessment Explanation**:
+   - Displays the complete factual proposition, claim ID, parent section, status badge, and risk level.
+   - Presents the plain-language assessment explanation provided by `ScriptFactChecker`.
+2. **Grounding vs Objective Truth Invariant**:
+   - Includes a persistent notice banner: *"Fact-check evaluations reflect grounding against retrieved research records, not a guarantee of absolute objective truth."*
+3. **Evidence Excerpts & Safe Citations**:
+   - Distinguishes **Supporting Evidence** from **Conflicting / Contradicting Evidence**.
+   - Displays verbatim evidence excerpts, locators, and source citations.
+   - Outbound source URLs are strictly verified for `http://` / `https://` protocols and rendered with `rel="noopener noreferrer"`.
+4. **Direct Conversational Challenge Controls**:
+   - Enables immediate conversational challenge with pre-populated target claim context.
+   - Action buttons for all 4 supported actions: `🔍 Investigate`, `⚖️ Qualify`, `✏️ Rephrase`, `🗑️ Remove`.
+   - Displays post-challenge outcome summary with honest indication of whether fresh research occurred.
+
+### 4.3 Conversational Fact Challenge Workflow (`ChatPanel.tsx` & `App.tsx`)
+1. **Mode Switcher in Chat Interface**:
+   - Provides seamless switching between `[ 📝 General Revision ]` and `[ ⚖️ Challenge Claim ]`.
+2. **Target Claim Identification**:
+   - Claim dropdown dynamically lists all active, linked claims with their current assessment status.
+   - Requires explicit selection of a target claim ID to prevent accidental challenge execution against unrelated text.
+3. **Timeline Event Formatting**:
+   - Conversation events with `event_type === "fact_challenge"` render custom cards displaying:
+     - Target claim ID and text snippet.
+     - Action pill (`investigate`, `qualify`, `rephrase`, `remove`).
+     - Fresh research indicator (`✨ Fresh Research Run` vs `🔍 Rechecked Existing Evidence`).
+     - Honest investigation notes and summary outcome text.
+4. **Atomic State Refresh**:
+   - Upon challenge completion, `App.tsx` updates `script`, `workflowState`, `factCheckReport`, `conversationHistory`, and `researchOverview` simultaneously.
+   - Ensures UI immediately reflects newly committed draft version, modified narration, and updated evidence usage.
+
+### 4.4 User Control & Finalization Invariants
+1. **No Auto-Finalization**:
+   - Challenging a claim always creates a new immutable draft version (`status: "draft"`).
+   - Preserves readiness criteria; script finalization requires explicit user approval via the Finalize Modal.
+2. **Historical Recoverability of Removed Claims**:
+   - When a claim is removed (`action="remove"`), it is unlinked from active section narration (`sec.claim_ids`), transitioning to `link_status="unlinked"`.
+   - Prior versions (`v001`, `v002`) remain untouched in immutable storage; removed claims remain historically auditable in prior script versions.
+3. **Zero Stale State Cross-Talk**:
+   - Switching projects resets `factCheckReport`, `researchOverview`, and claim inspection modal state to `null` before loading the newly selected project data.
+
+---
+
+## 5. Verification & Test Evidence
+
+### 5.1 Deterministic Test Suites
+1. **Backend Integration & Domain Regression** (`backend/tests/test_phase6_checkpoint1_api_and_challenge.py`):
+   - **16 passing tests** verifying overview empty states, 4-state query lifecycles, brief retrieval, versioned reports, all 4 challenge actions, provenance preservation, and re-challenge guards.
+2. **Architectural Boundary Enforcement** (`backend/tests/test_import_rules.py`):
+   - **2 passing tests** ensuring zero architectural boundary violations.
+3. **Frontend Domain & State Contracts** (`frontend/tests/research_studio_states.test.ts`):
+   - **8 passing tests** covering candidate vs selected semantics, empty states, query filters, and stale data prevention.
+4. **Claim Badges, Inspection & Challenge Mechanics** (`frontend/tests/claim_badges_and_challenge.test.ts`):
+   - **8 passing tests** verifying discrete claim annotations, unassessed fallback, truth disclaimer, 4 challenge action requests, fresh vs recheck reporting, removed claim history, and draft version preservation.
+5. **Live Vite Proxy & Backend Integration** (`frontend/tests/live_ui_backend_integration.test.ts`):
+   - **8 passing tests** executed against live backend (8000) via Vite dev proxy (5173), validating live proxy health, representative project states, safe source links, 404 handling, and live claim challenge execution.
+
+### 5.2 Build Verification
+- Production build verified cleanly: `npm --prefix frontend run build` (`tsc -b && vite build`) completed with 0 errors and 0 warnings.

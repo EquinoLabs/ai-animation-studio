@@ -2,9 +2,14 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
+import socket
+import subprocess
 import sys
+import time
 from typing import List, Optional
+import webbrowser
 
 from backend.app.config import get_settings
 from backend.app.domain.project import STAGE_NAMES
@@ -75,6 +80,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--serve",
         action="store_true",
         help="Start the local API web server on 127.0.0.1:8000",
+    )
+    action_group.add_argument(
+        "--studio",
+        action="store_true",
+        help="Launch the full local studio (starts backend and frontend UI, opens browser)",
+    )
+    action_group.add_argument(
+        "--script-builder",
+        action="store_true",
+        help="Open the Script Builder experience in browser (launches studio if not already running)",
+    )
+    action_group.add_argument(
+        "--script-writing",
+        action="store_true",
+        help="Alias for --script: Run script generation stage for a project (requires --project)",
+    )
+    action_group.add_argument(
+        "--scene-builder",
+        action="store_true",
+        help="Alias for --plan-scenes: Run scene planning stage for a project (requires --project)",
     )
 
     # Parameters
@@ -191,6 +216,85 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+    """Check if a TCP port is currently open and listening."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((host, port)) == 0
+
+
+def _launch_studio(host: str = "127.0.0.1", backend_port: int = 8000, frontend_port: int = 5173, open_browser: bool = True) -> int:
+    """Launch the local development studio: backend API and frontend dev server."""
+    repo_root = Path(__file__).resolve().parent.parent.parent.parent
+    venv_python = repo_root / "backend" / ".venv" / "Scripts" / "python.exe"
+    py_exec = str(venv_python) if venv_python.exists() else sys.executable
+
+    print("=================================================================", flush=True)
+    print("           AI ANIMATION STUDIO — LOCAL STUDIO LAUNCHER           ", flush=True)
+    print("=================================================================", flush=True)
+
+    started_procs: List[subprocess.Popen] = []
+
+    # 1. Backend server check & spawn
+    backend_url = f"http://{host}:{backend_port}"
+    if _is_port_in_use(backend_port, host):
+        print(f"[*] Backend API is already running on {backend_url}", flush=True)
+    else:
+        print(f"[*] Starting Backend server on {backend_url} ...", flush=True)
+        cmd_backend = [py_exec, "-m", "uvicorn", "backend.app.main:app", "--host", host, "--port", str(backend_port)]
+        backend_proc = subprocess.Popen(cmd_backend, cwd=str(repo_root))
+        started_procs.append(backend_proc)
+
+    # 2. Frontend server check & spawn
+    frontend_url = f"http://{host}:{frontend_port}"
+    if _is_port_in_use(frontend_port, host):
+        print(f"[*] Frontend Studio is already running on {frontend_url}", flush=True)
+    else:
+        print(f"[*] Starting Frontend Studio on {frontend_url} ...", flush=True)
+        npm_cmd = "npm.cmd" if sys.platform == "win32" else "npm"
+        cmd_frontend = [npm_cmd, "--prefix", "frontend", "run", "dev", "--", "--host", host, "--port", str(frontend_port)]
+        frontend_proc = subprocess.Popen(cmd_frontend, cwd=str(repo_root))
+        started_procs.append(frontend_proc)
+
+    # Allow brief startup time
+    time.sleep(1.5)
+
+    print("\n-----------------------------------------------------------------", flush=True)
+    print(f"  Studio Web UI:   {frontend_url}", flush=True)
+    print(f"  Backend API:     {backend_url}", flush=True)
+    print("-----------------------------------------------------------------", flush=True)
+    print("Press CTRL+C to stop all studio services.\n", flush=True)
+
+    if open_browser:
+        try:
+            webbrowser.open(frontend_url)
+        except Exception:
+            pass
+
+    if not started_procs:
+        print("Both services are already active in the background. Press CTRL+C to exit launcher.", flush=True)
+
+    try:
+        while True:
+            time.sleep(1)
+            for p in started_procs:
+                if p.poll() is not None:
+                    print(f"\n[!] Process PID {p.pid} exited with code {p.returncode}.", flush=True)
+                    return p.returncode
+    except KeyboardInterrupt:
+        print("\n[*] Shutting down studio services...", flush=True)
+        for p in started_procs:
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    p.terminate()
+            except Exception:
+                pass
+        print("[*] All studio services stopped.", flush=True)
+        return 0
+
+
 def run_cli(args_list: Optional[List[str]] = None) -> int:
     """Execute CLI logic and return an appropriate process exit code."""
     parser = build_parser()
@@ -261,10 +365,16 @@ def run_cli(args_list: Optional[List[str]] = None) -> int:
         uvicorn.run("backend.app.main:app", host=args.host, port=args.port, reload=False)
         return 0
 
-    # 4. Stage Execution Commands
+    # 4. Studio / Script Builder Command (Launches frontend and backend together)
+    if args.studio or args.script_builder:
+        return _launch_studio(host=args.host, backend_port=args.port, open_browser=True)
+
+    # 5. Stage Execution Commands
+    is_script = bool(args.script or args.script_writing)
+    is_plan_scenes = bool(args.plan_scenes or args.scene_builder)
     stage_flags = {
-        "script": args.script,
-        "plan-scenes": args.plan_scenes,
+        "script": is_script,
+        "plan-scenes": is_plan_scenes,
         "script-to-voice": args.script_to_voice,
         "video": args.video,
         "full": args.full,
@@ -273,11 +383,12 @@ def run_cli(args_list: Optional[List[str]] = None) -> int:
 
     if selected_stage:
         if not args.project:
-            sys.stderr.write(f"Error: --{selected_stage} requires --project <project_id>.\n")
+            flag_name = "script-writing" if args.script_writing else ("scene-builder" if args.scene_builder else selected_stage)
+            sys.stderr.write(f"Error: --{flag_name} requires --project <project_id>.\n")
             return 2
 
         # Script-specific sub-operations
-        if args.script:
+        if is_script:
             has_subop = any([
                 args.topic,
                 args.instruction,

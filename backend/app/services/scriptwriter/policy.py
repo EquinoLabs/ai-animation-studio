@@ -101,6 +101,104 @@ def get_structure_guidance(structure: NarrativeStructure) -> Dict[str, str]:
         }
 
 
+def get_multi_beat_guidance(
+    section_type: str,
+    target_words: int,
+    structure: NarrativeStructure = "chronological",
+) -> List[str]:
+    """Return recommended multi-beat milestone directives calibrated to section role, word count, and structure.
+
+    Ensures that each section's target length is supported by 2-4 concrete factual milestones / narrative beats,
+    rather than a single superficial bullet.
+    """
+    stype = (section_type or "").lower().strip()
+
+    if stype == "hook":
+        return [
+            "Establish the central puzzle, paradox, or counter-intuitive dilemma that halts the audience.",
+            "Formulate the high-stakes inquiry or core question that this documentary resolves.",
+        ]
+    elif stype == "setup":
+        if structure == "mechanism_breakdown":
+            return [
+                "Establish baseline operational state and macro-system boundaries before component breakdown.",
+                "Identify foundational constraints, input variables, and the primary obstacle to efficiency.",
+            ]
+        elif structure == "problem_solution":
+            return [
+                "Establish historical or operational baseline under traditional approaches.",
+                "Detail the compounding failures, bottlenecks, and escalating costs of the unresolved crisis.",
+            ]
+        else:  # chronological
+            return [
+                "Establish historical context, socio-technical baseline conditions, and pre-existing paradigms.",
+                "Examine the specific operational limitations, bottlenecks, or friction points confronting innovators.",
+            ]
+    elif stype == "middle":
+        # Middle sections carry the core explanatory weight; scale beats with target words
+        if target_words >= 200:
+            if structure == "mechanism_breakdown":
+                return [
+                    "Deconstruct the primary component architecture and initial mechanical inputs.",
+                    "Trace the internal causal chain: secondary interactions, energy transfers, and feedback loops.",
+                    "Examine critical technical trade-offs, failure modes, and stabilization countermeasures.",
+                ]
+            elif structure == "problem_solution":
+                return [
+                    "Investigate early experimental attempts, dead-ends, and why initial countermeasures failed.",
+                    "Analyze the technical paradigm shift or alternative mechanism that challenged prevailing methods.",
+                    "Document rigorous iterative testing, progressive refinement, and overcoming secondary obstacles.",
+                ]
+            else:  # chronological
+                return [
+                    "Document early incremental trials, foundational experiments, and initial setbacks.",
+                    "Examine pivotal transitions, shifting methodologies, and intermediate breakthroughs.",
+                    "Detail the convergence of evidence, emerging consensus, and preparatory work before the turning point.",
+                ]
+        else:
+            if structure == "mechanism_breakdown":
+                return [
+                    "Deconstruct primary component interactions and initial mechanical inputs.",
+                    "Detail sequential causal mechanisms and internal feedback loops.",
+                ]
+            elif structure == "problem_solution":
+                return [
+                    "Examine early experimental trials and the nature of initial obstacles.",
+                    "Detail the innovative approach engineered to overcome the core bottleneck.",
+                ]
+            else:
+                return [
+                    "Detail sequential evolutionary trials and emerging intermediate discoveries.",
+                    "Examine the critical transitional stage leading toward resolution.",
+                ]
+    elif stype == "climax":
+        if structure == "mechanism_breakdown":
+            return [
+                "Reveal the definitive systemic synthesis where internal mechanisms produce the macro phenomenon.",
+                "Highlight the empirical verification or observable breakthrough confirming the principle.",
+            ]
+        elif structure == "problem_solution":
+            return [
+                "Detail the decisive breakthrough test or paradigm realization that conquered the bottleneck.",
+                "Demonstrate verifiable performance gains or systemic resolution achieved.",
+            ]
+        else:
+            return [
+                "Detail the decisive historic moment, pivotal trial, or turning point where breakthrough succeeded.",
+                "Examine immediate verifiable outcomes and subsequent validation.",
+            ]
+    elif stype == "takeaway":
+        return [
+            "Synthesize lasting principles, broader implications, and modern real-world applications.",
+            "Deliver a memorable closing perspective on how this transformation reshapes our understanding.",
+        ]
+    else:
+        return [
+            "Primary explanatory beat detailing core mechanisms.",
+            "Secondary explanatory beat addressing implications and evidence.",
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Hook Architecture Formulas
 # ---------------------------------------------------------------------------
@@ -177,18 +275,23 @@ STRICT ANTI-FILLER & FACTUAL RESTRAINT DIRECTIVES:
      "When put to work, each component plays a role", "Now let us delve deeper into this journey",
      "The story of [topic] is one of wonder and mystery").
    - Every single spoken sentence must convey specific, concrete information unique to this topic.
-2. HONEST FACTUAL BOUNDARIES:
+2. LEGITIMATE NARRATIVE DEPTH WITHOUT FILLER:
+   - To satisfy pacing and target duration legitimately without empty filler:
+     * Break down causes, mechanisms, cognitive/biological steps, and real-world consequences in detail.
+     * Contrast mechanisms with everyday examples, analogies (e.g. 'Think of it like...'), and alternative systems.
+     * Explain *why* and *how* something happens, rather than only summarizing that it happened.
+3. HONEST FACTUAL BOUNDARIES:
    - Do NOT invent historical anecdotes, fabricated quotes, imaginary dialogue, or fake statistics.
    - Distinct Narrative Layers: Clearly distinguish between factual assertions and creative framing.
      When using metaphors, analogies, or thought experiments, frame them explicitly as analogies
      (e.g. "Think of it like...", "Imagine a system where..."), never as literal historical facts.
-3. RETRIEVED DOES NOT EQUAL VERIFIED:
+4. RETRIEVED DOES NOT EQUAL VERIFIED:
    - When evidence from research is provided, cite declared evidence IDs accurately.
    - Declaring an evidence ID indicates an association with a retrieved source excerpt; it does
      NOT establish that the record exists in storage or that the claim is verified.
    - Do NOT fabricate evidence IDs, source URLs, or citations.
    - If an assertion is made that lacks supporting research, state it plainly without inventing evidence.
-4. ACTIONABLE VISUAL STAGING AS GUIDANCE:
+5. ACTIONABLE VISUAL STAGING AS GUIDANCE:
    - Pair narration with 2D animation staging suggestions in the 'notes' field where visual depiction
      clarifies the concept (e.g. '[Cutaway: diagram of cable core]', '[Character pose: explain, expression: focused]').
    - Visual cues are creative guidance to support story clarity; do NOT force artificial or repetitive
@@ -263,6 +366,7 @@ class ScriptPromptBuilder:
                 f"--- END RESEARCH EVIDENCE BRIEF ---\n\n"
                 f"EVIDENCE UTILIZATION RULES:\n"
                 f"- Map relevant evidence IDs from the brief to the appropriate outline sections in 'evidence_ids'.\n"
+                f"- Permitted evidence IDs strictly start with 'evi_' (e.g. 'evi_...'). Do NOT use question numbers or integers.\n"
                 f"- Plan factual milestones informed by the retrieved evidence items in the brief.\n"
                 f"- Citing an evidence ID in 'evidence_ids' declares a reference to a retrieved research excerpt; it does not certify absolute factual truth.\n"
                 f"- Do NOT invent evidence IDs not present in the research brief.\n"
@@ -281,6 +385,11 @@ Storytelling Architecture:
 {hook_guide}
 
 {tone_guide}
+
+Multi-Beat Narrative Outline Requirements:
+- Each section's target words require 2–4 concrete factual milestones / narrative beats, NOT a single superficial bullet.
+- Substantial sections (~150–250+ words, such as 'middle') MUST specify at least 3 distinct mechanical steps, causal transitions, or sequential developments to ensure sufficient explanatory depth.
+- Each milestone must describe a specific, concrete concept or causal mechanism rather than a generic summary.
 
 Section Roles & Structural Milestones:
 1. "hook" (~{metrics['hook_words']} words target):
@@ -583,5 +692,180 @@ Application Schema Validation Note:
 Output will be validated strictly by Pydantic against domain contracts. Ensure section IDs and claim section_id links remain consistent.
 
 Output strictly valid JSON matching the 5-section Script schema (hook, setup, middle, climax, takeaway).
+"""
+        return prompt
+
+    def build_single_section_prompt(
+        self,
+        topic: str,
+        target_duration_minutes: float,
+        section_index: int,
+        total_sections: int,
+        section_type: str,
+        heading: str,
+        target_words: int,
+        factual_milestones: List[str],
+        visual_concept: Optional[str] = None,
+        evidence_brief_text: Optional[str] = None,
+        preceding_sections_summary: Optional[str] = None,
+        permitted_evidence_ids: Optional[List[str]] = None,
+        is_unresearched: bool = False,
+    ) -> str:
+        """Construct prompt for generating a single, richly developed section of a script draft."""
+        tone_guide = get_tone_guidance(self.policy.tone)
+        guidance = get_structure_guidance(self.policy.narrative_structure)
+        role_description = guidance.get(section_type, "Advance the core narrative with factual clarity.")
+
+        milestones_formatted = "\n".join(f"  * {m}" for m in (factual_milestones or ["Explain the core concept in depth."]))
+
+        continuity_section = ""
+        if preceding_sections_summary and preceding_sections_summary.strip():
+            continuity_section = (
+                f"\n--- NARRATIVE CONTINUITY & CONTEXT ---\n"
+                f"Preceding sections have already covered:\n"
+                f"{preceding_sections_summary.strip()}\n"
+                f"Instruction: Ensure a seamless narrative transition from the preceding section. "
+                f"Propel the story forward without repeating explanations or introductory throat-clearing.\n"
+                f"--- END NARRATIVE CONTINUITY ---\n"
+            )
+
+        evidence_section = ""
+        if is_unresearched:
+            evidence_section = (
+                f"\n--- UNRESEARCHED MODE DIRECTIVE ---\n"
+                f"This section is being generated in UNRESEARCHED mode without external research grounding.\n"
+                f"- Do NOT cite any evidence IDs in 'evidence_ids' (must be empty list [] for all claims).\n"
+                f"- Do NOT hallucinate sources or evidence identifiers.\n"
+                f"--- END UNRESEARCHED MODE DIRECTIVE ---\n"
+            )
+        else:
+            brief_snippet = ""
+            if evidence_brief_text and evidence_brief_text.strip():
+                brief_snippet = f"\nRelevant Evidence Excerpts:\n{evidence_brief_text.strip()}\n"
+
+            permitted = sorted(list(set(permitted_evidence_ids or [])))
+            evidence_section = (
+                f"\n--- RESEARCH EVIDENCE & GROUNDING ---\n"
+                f"{brief_snippet}"
+                f"GROUNDING & CLAIM ATTRIBUTION INSTRUCTIONS:\n"
+                f"- Ground factual statements in the provided source excerpts.\n"
+                f"- Permitted evidence IDs: {permitted}\n"
+                f"- In the 'claims' array, list every discrete factual assertion made in this section's narration.\n"
+                f"- For each claim, set 'claim_text' and reference declared evidence IDs in 'evidence_ids' (e.g. ['evi_...']).\n"
+                f"- Only cite evidence IDs from the permitted list above. If an assertion lacks retrieved evidence, leave 'evidence_ids' as [].\n"
+                f"- Citing an evidence ID declares a reference to a retrieved research excerpt; it does not certify absolute factual truth.\n"
+                f"- Do NOT invent evidence IDs not listed above.\n"
+                f"--- END RESEARCH EVIDENCE & GROUNDING ---\n"
+            )
+
+        prompt = f"""You are a senior educational scriptwriter for engaging animated explainer documentaries.
+Write spoken voiceover narration for Section {section_index + 1} of {total_sections} of a script on '{topic}'.
+
+Section Specifications:
+- Overall Topic: {topic}
+- Section Role: "{section_type}" ({role_description})
+- Section Heading: "{heading}"
+- Target Word Count: ~{target_words} spoken words (aim for substantial explanatory depth matching ~{target_words} words; do not abbreviate or write superficially).
+- Section Visual Staging Concept: {visual_concept or 'Actionable 2D staging cues'}
+
+Factual Milestones & Narrative Beats to Cover:
+{milestones_formatted}
+{continuity_section}
+{tone_guide}
+{evidence_section}
+{ANTI_FILLER_DIRECTIVES}
+
+Application Schema Validation Note:
+Output will be validated strictly by Pydantic against GeneratedSectionPayload.
+Ensure 'heading' and 'narration' are non-empty. Every claim must have 'claim_text' and 'evidence_ids'.
+
+Output strictly valid JSON matching this schema:
+{{
+  "heading": "{heading}",
+  "narration": "Full spoken voiceover text covering the milestones in ~{target_words} words...",
+  "notes": "Actionable 2D animation staging cues and character poses...",
+  "claims": [
+    {{
+      "claim_id": "clm_01",
+      "claim_text": "Discrete factual assertion made in the narration",
+      "evidence_ids": []
+    }}
+  ]
+}}
+"""
+        return prompt
+
+    def build_section_expansion_prompt(
+        self,
+        topic: str,
+        section_type: str,
+        heading: str,
+        target_words: int,
+        current_narration: str,
+        current_word_count: int,
+        factual_milestones: List[str],
+        evidence_brief_text: Optional[str] = None,
+        permitted_evidence_ids: Optional[List[str]] = None,
+        is_unresearched: bool = False,
+    ) -> str:
+        """Construct prompt for targeted expansion of an underdeveloped script section."""
+        tone_guide = get_tone_guidance(self.policy.tone)
+        milestones_formatted = "\n".join(f"  * {m}" for m in (factual_milestones or ["Explain the core concept in depth."]))
+
+        evidence_section = ""
+        if is_unresearched:
+            evidence_section = (
+                f"\n--- UNRESEARCHED MODE DIRECTIVE ---\n"
+                f"Do NOT cite any evidence IDs in 'evidence_ids' (must be empty list [] for all claims).\n"
+            )
+        elif permitted_evidence_ids:
+            permitted = sorted(list(set(permitted_evidence_ids)))
+            evidence_section = (
+                f"\n--- PERMITTED EVIDENCE IDS ---\n"
+                f"Permitted evidence IDs: {permitted}\n"
+                f"If new assertions are made, cite only permitted evidence IDs, or leave 'evidence_ids' as [].\n"
+            )
+
+        prompt = f"""You are a senior educational scriptwriter expanding an underdeveloped script section.
+
+The current draft narration for section '{heading}' is significantly shorter than required:
+- Current Length: {current_word_count} words
+- Target Length: ~{target_words} words
+- Section Type: {section_type}
+- Overall Topic: {topic}
+
+Current Narration:
+\"\"\"
+{current_narration}
+\"\"\"
+
+Required Factual Milestones:
+{milestones_formatted}
+
+EXPANSION DIRECTIVES:
+1. Deepen the explanation by unpacking specific causal mechanisms, step-by-step physical or historical processes, and concrete examples.
+2. Maintain natural spoken voiceover flow and narrative propulsion.
+3. STRICT ANTI-FILLER RULE: Do NOT pad with repetitive summaries, rhetorical throat-clearing, or generic adjectives. Every added sentence must convey substantive informational value.
+4. Aim for ~{target_words} spoken words total.
+{tone_guide}
+{evidence_section}
+{ANTI_FILLER_DIRECTIVES}
+
+Application Schema Validation Note:
+Output will be validated strictly by Pydantic against GeneratedSectionPayload.
+
+Output strictly valid JSON matching this schema:
+{{
+  "heading": "{heading}",
+  "narration": "Expanded spoken voiceover text providing rich explanatory depth (~{target_words} words)...",
+  "notes": "Actionable 2D staging cues...",
+  "claims": [
+    {{
+      "claim_id": "clm_01",
+      "claim_text": "Discrete factual assertion made in the narration",
+      "evidence_ids": []
+    }}
+  ]
+}}
 """
         return prompt

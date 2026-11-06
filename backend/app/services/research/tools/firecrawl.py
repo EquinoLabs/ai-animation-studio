@@ -2,6 +2,7 @@
 
 import json
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 import httpx
 from pydantic import BaseModel, Field
 
@@ -36,17 +37,44 @@ class FirecrawlExtractTool(ResearchTool):
     )
     parameters_schema = FirecrawlExtractArgs
 
-    API_ENDPOINT = "https://api.firecrawl.dev/v1/scrape"
+    DEFAULT_API_ENDPOINT = "https://api.firecrawl.dev/v1/scrape"
+    API_ENDPOINT = DEFAULT_API_ENDPOINT
 
     def __init__(
         self,
         api_key: Optional[str] = None,
+        api_url: Optional[str] = None,
         settings: Optional[Settings] = None,
         client: Optional[httpx.Client] = None,
     ) -> None:
         self._settings = settings or get_settings()
         self._api_key = api_key or self._settings.FIRECRAWL_API_KEY
         self._client = client
+        if api_url is not None:
+            configured_url = api_url
+        else:
+            configured_url = getattr(self._settings, "FIRECRAWL_API_URL", None) or self.DEFAULT_API_ENDPOINT
+        self._api_url = self._validate_api_url(configured_url)
+
+    @property
+    def api_url(self) -> str:
+        """Return the validated Firecrawl API endpoint URL."""
+        return self._api_url
+
+    @staticmethod
+    def _validate_api_url(url: str) -> str:
+        if not url or not isinstance(url, str):
+            raise UnsafeURLError("Firecrawl API URL must be a non-empty string.")
+        stripped = url.strip()
+        parsed = urlsplit(stripped)
+        scheme = (parsed.scheme or "").lower()
+        if scheme not in ("http", "https"):
+            raise UnsafeURLError(f"Unsupported Firecrawl API URL scheme '{scheme}'. Only HTTP and HTTPS are permitted.")
+        if parsed.username or parsed.password:
+            raise UnsafeURLError("Firecrawl API URL must not contain embedded user credentials.")
+        if not (parsed.hostname or "").strip():
+            raise UnsafeURLError("Firecrawl API URL must contain a valid hostname.")
+        return stripped
 
     def _get_api_key(self) -> str:
         key = self._api_key or self._settings.FIRECRAWL_API_KEY
@@ -87,7 +115,7 @@ class FirecrawlExtractTool(ResearchTool):
             try:
                 with client.stream(
                     "POST",
-                    self.API_ENDPOINT,
+                    self._api_url,
                     json=payload,
                     headers=headers,
                     timeout=effective_timeout,

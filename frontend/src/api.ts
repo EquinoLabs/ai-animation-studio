@@ -10,6 +10,10 @@ import {
   ResearchOverviewResponse,
   ResearchBriefResponse,
   ScriptFactCheckReport,
+  ChallengeClaimRequest,
+  ChallengeClaimResponse,
+  StartResearchRequest,
+  StartResearchResponse,
 } from './types';
 
 const API_BASE = '/api/v1';
@@ -145,7 +149,19 @@ export const api = {
     return handleResponse<Script[]>(res);
   },
 
-  // Research Studio & Fact-Checking (Phase 6 Checkpoint 1 & 2)
+  // Research Studio & Fact-Checking (Phase 6 & Phase 7)
+  startResearch: async (
+    projectId: string,
+    req: StartResearchRequest
+  ): Promise<StartResearchResponse> => {
+    const res = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/research/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req),
+    });
+    return handleResponse<StartResearchResponse>(res);
+  },
+
   getResearchOverview: async (projectId: string): Promise<ResearchOverviewResponse> => {
     const res = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/research`);
     return handleResponse<ResearchOverviewResponse>(res);
@@ -161,5 +177,18 @@ export const api = {
     const query = version !== undefined ? `?version=${encodeURIComponent(version)}` : '';
     const res = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/script/fact-check${query}`);
     return handleResponse<ScriptFactCheckReport>(res);
+  },
+
+  // Conversational Fact Challenges (Phase 6 Checkpoint 3)
+  challengeClaim: async (
+    projectId: string,
+    req: ChallengeClaimRequest
+  ): Promise<ChallengeClaimResponse> => {
+    const res = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/script/challenge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req),
+    });
+    return handleResponse<ChallengeClaimResponse>(res);
   },
 };

@@ -13,9 +13,12 @@ from backend.app.domain.research import (
     ChallengeClaimResponse,
     QueryOutcomeView,
     ResearchBriefResponse,
+    ResearchBudgetConstraints,
     ResearchOverviewResponse,
+    ResearchPlannerInput,
     SafeEvidenceView,
     SafeSourceView,
+    StartResearchResponse,
 )
 from backend.app.domain.project import (
     ProjectMetadata,
@@ -31,7 +34,10 @@ from backend.app.services.project.service import (
     ProjectService,
     ProjectValidationError,
 )
+from backend.app.services.research.evidence_brief import EvidenceBriefBuilder
 from backend.app.services.research.orchestrator import ResearchOrchestrator
+from backend.app.services.research.tools.factory import ResearchToolFactory
+from backend.app.services.research.tools.mock import MockSearchTool
 from backend.app.services.research.storage import (
     ResearchEvidenceNotFoundError,
     ResearchPlanNotFoundError,
@@ -132,6 +138,31 @@ class PipelineOrchestrator:
         }
         if register_builtins:
             self.register_script_handler()
+
+    @classmethod
+    def create_production(
+        cls,
+        project_service: Optional[ProjectService] = None,
+        settings: Optional[Settings] = None,
+        use_mocks: bool = False,
+    ) -> "PipelineOrchestrator":
+        """Construct a production PipelineOrchestrator with wired ResearchOrchestrator."""
+        cfg = settings or get_settings()
+        ps = project_service or ProjectService(settings=cfg)
+        storage = ResearchStorageService(
+            projects_root=ps.projects_root,
+            settings=cfg,
+        )
+        ro = ResearchToolFactory.create_orchestrator(
+            settings=cfg,
+            storage_service=storage,
+            use_mocks=use_mocks,
+        )
+        return cls(
+            project_service=ps,
+            research_orchestrator=ro,
+            settings=cfg,
+        )
 
     def register_stage_handler(self, stage_name: str, handler: StageHandler) -> None:
         """Register or override a stage handler (used by production modules or test doubles)."""
@@ -442,6 +473,104 @@ class PipelineOrchestrator:
         except Exception as exc:
             return StageResult(success=False, error=f"Script stage execution failed: {exc}")
 
+    def start_research(
+        self,
+        project_id: str,
+        topic: str,
+        target_duration_minutes: Optional[float] = None,
+        user_guidance: Optional[str] = None,
+        budget_limits: Optional[ResearchBudgetConstraints] = None,
+    ) -> StartResearchResponse:
+        """Initiate research planning, tool execution, evidence extraction, and brief compilation."""
+        # 1. Validate project existence & isolation
+        self.project_service.get_project(project_id)
+        clean_topic = (topic or "").strip()
+        if not clean_topic:
+            raise ResearchValidationError("Topic cannot be empty or whitespace-only.")
+
+        # 2. Ensure ResearchOrchestrator is available
+        if self.research_orchestrator is None:
+            self.research_orchestrator = ResearchToolFactory.create_orchestrator(
+                settings=self.settings,
+                storage_service=self.research_storage,
+            )
+            if hasattr(self.script_service, "research_orchestrator"):
+                self.script_service.research_orchestrator = self.research_orchestrator
+
+        # Proactively validate external credentials when using real production tools
+        search_tool = self.research_orchestrator.tool_registry.get("tavily_search")
+        if not isinstance(search_tool, MockSearchTool):
+            ResearchToolFactory.validate_credentials(self.settings)
+
+        # 3. Construct ResearchPlanner
+        planner = ResearchToolFactory.create_planner(
+            settings=self.settings,
+            storage_service=self.research_storage,
+        )
+
+        # 4. Formulate ResearchPlan via configured LLM provider
+        effective_budget = budget_limits or ResearchBudgetConstraints(
+            max_search_calls=self.settings.RESEARCH_MAX_SEARCH_CALLS,
+            max_extract_calls=self.settings.RESEARCH_MAX_EXTRACT_CALLS,
+            call_timeout_seconds=self.settings.RESEARCH_CALL_TIMEOUT_SECONDS,
+            deadline_seconds=self.settings.RESEARCH_DEADLINE_SECONDS,
+            max_page_chars=self.settings.RESEARCH_MAX_PAGE_CHARS,
+            max_total_chars=self.settings.RESEARCH_MAX_TOTAL_CHARS,
+        )
+        planner_input = ResearchPlannerInput(
+            project_id=project_id,
+            topic=clean_topic,
+            target_duration_minutes=target_duration_minutes,
+            user_guidance=user_guidance,
+            budget_limits=effective_budget,
+        )
+        plan = planner.plan_research(planner_input)
+
+        # 5. Execute ResearchPlan via ResearchOrchestrator
+        run = self.research_orchestrator.execute_plan(project_id, plan.plan_id)
+
+        # 6. If run has evidence records or reached completion, compile and save evidence brief
+        has_brief = False
+        evidence_records = self.research_storage.list_evidence(project_id, run_id=run.run_id)
+        if evidence_records:
+            try:
+                brief_builder = EvidenceBriefBuilder(
+                    storage_service=self.research_storage,
+                    settings=self.settings,
+                )
+                brief_builder.build_and_save_brief(project_id, run.run_id)
+                has_brief = True
+            except Exception:
+                has_brief = False
+
+        # 7. Update project stage metadata
+        try:
+            self.project_service.update_stage_status(
+                project_id,
+                "script",
+                "in_progress",
+            )
+        except Exception:
+            pass
+
+        # 8. Retrieve complete ResearchOverviewResponse
+        overview = self.get_research_overview(project_id)
+
+        return StartResearchResponse(
+            project_id=project_id,
+            plan_id=plan.plan_id,
+            run_id=run.run_id,
+            status=run.status,
+            termination_reason=run.termination_reason,
+            search_calls_used=run.search_calls_used,
+            extract_calls_used=run.extract_calls_used,
+            total_chars_extracted=run.total_chars_extracted,
+            evidence_count=len(evidence_records),
+            sources_count=len(self.research_storage.list_sources(project_id)),
+            has_brief=has_brief,
+            overview=overview,
+        )
+
     def start_script(
         self,
         project_id: str,
@@ -450,12 +579,47 @@ class PipelineOrchestrator:
         title: Optional[str] = None,
         research_run_id: Optional[str] = None,
         allow_unresearched: bool = False,
+        auto_research: bool = True,
         outline: Optional[ScriptOutline] = None,
     ) -> Script:
-        """Delegate script initiation to the script service."""
+        """Start script generation, automatically executing research if needed."""
+        clean_topic = (topic or "").strip()
+        if not clean_topic:
+            raise ScriptValidationError("Topic cannot be empty or whitespace-only.")
+
+        # If unresearched is not explicitly allowed, no explicit run is provided, and project has no completed usable runs:
+        if not research_run_id and not allow_unresearched and auto_research:
+            existing_runs = self.research_storage.list_runs(project_id)
+            # A run is eligible for automatic script generation only if its status is completed
+            # AND it contains at least one evidence record belonging to that exact run.
+            usable_run = None
+            sorted_runs = sorted(existing_runs, key=lambda r: r.started_at, reverse=True)
+            for r in sorted_runs:
+                if r.status == "completed":
+                    run_evidence = self.research_storage.list_evidence(project_id, run_id=r.run_id)
+                    if any(ev.run_id == r.run_id for ev in run_evidence):
+                        usable_run = r
+                        break
+
+            if usable_run:
+                research_run_id = usable_run.run_id
+            else:
+                res_resp = self.start_research(
+                    project_id=project_id,
+                    topic=clean_topic,
+                    target_duration_minutes=target_duration_minutes,
+                )
+                if res_resp.evidence_count == 0:
+                    raise PipelineError(
+                        f"Automated research returned 0 evidence records for topic '{clean_topic}' "
+                        f"(status: {res_resp.status}, termination: {res_resp.termination_reason}). "
+                        f"Cannot ground script without retrieved evidence."
+                    )
+                research_run_id = res_resp.run_id
+
         return self.script_service.start_script(
             project_id=project_id,
-            topic=topic,
+            topic=clean_topic,
             target_duration_minutes=target_duration_minutes,
             title=title,
             research_run_id=research_run_id,

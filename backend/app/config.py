@@ -44,6 +44,10 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("ANIM_FIRECRAWL_API_KEY", "FIRECRAWL_API_KEY"),
     )
+    FIRECRAWL_API_URL: str = Field(
+        default="https://api.firecrawl.dev/v1/scrape",
+        validation_alias=AliasChoices("ANIM_FIRECRAWL_API_URL", "FIRECRAWL_API_URL"),
+    )
     RESEARCH_MAX_SEARCH_CALLS: int = 3
     RESEARCH_MAX_EXTRACT_CALLS: int = 3
     RESEARCH_CALL_TIMEOUT_SECONDS: float = 15.0
