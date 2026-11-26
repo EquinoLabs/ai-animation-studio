@@ -301,6 +301,12 @@ class ScriptFactCheckReport(BaseModel):
         if normal_risk_unsupported:
             flagged_warnings.append(f"{len(normal_risk_unsupported)} normal-risk claim(s) unsupported")
 
+        normal_risk_partially_supported = [
+            a for a in self.assessments if a.risk_level != "high" and a.status == "partially_supported"
+        ]
+        if normal_risk_partially_supported:
+            flagged_warnings.append(f"{len(normal_risk_partially_supported)} normal-risk claim(s) partially supported")
+
         unresearched_non_high = [
             a for a in self.assessments
             if a.status == "not_checked" and a.unassessed_reason == "unresearched_script" and a.risk_level != "high"

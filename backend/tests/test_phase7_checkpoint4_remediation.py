@@ -376,8 +376,8 @@ def test_round_robin_extraction_allocates_across_queries(tmp_path) -> None:
     }
     extract_data = {
         "https://example.com/q1_s1": "# Q1 Content\n\nSubstantive historical analysis of habit development in ancient Greece showed virtues were formed by repetition.",
-        "https://example.com/q2_s1": "# Q2 Content\n\nNeurological pathways in the basal ganglia regulate automatic motor behaviors through repeated synaptic strengthening.",
-        "https://example.com/q3_s1": "# Q3 Content\n\nPsychological cue-routine-reward loops govern daily behavioral formation and automatic response patterns.",
+        "https://example.com/q2_s1": "# Q2 Content\n\nNeurological pathways in the basal ganglia regulate automatic motor behaviors through repeated synaptic strengthening in habit formation.",
+        "https://example.com/q3_s1": "# Q3 Content\n\nPsychological cue-routine-reward loops govern daily behavioral habit formation and automatic response patterns.",
     }
 
     extracted_urls: list[str] = []

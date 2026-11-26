@@ -55,6 +55,24 @@ class Settings(BaseSettings):
     RESEARCH_MAX_PAGE_CHARS: int = 15000
     RESEARCH_MAX_TOTAL_CHARS: int = 45000
 
+    # Additional research providers configuration (Phase 7 expansion)
+    WIKIMEDIA_USER_AGENT: str = Field(
+        default="ai-animation-studio/1.0 (educational research; mailto:info@example.com)",
+        validation_alias=AliasChoices("ANIM_WIKIMEDIA_USER_AGENT", "WIKIMEDIA_USER_AGENT"),
+    )
+    INTERNET_ARCHIVE_USER_AGENT: str = Field(
+        default="ai-animation-studio/1.0 (educational research; mailto:info@example.com)",
+        validation_alias=AliasChoices("ANIM_INTERNET_ARCHIVE_USER_AGENT", "INTERNET_ARCHIVE_USER_AGENT"),
+    )
+    OPENALEX_USER_AGENT: str = Field(
+        default="ai-animation-studio/1.0 (educational research; mailto:info@example.com)",
+        validation_alias=AliasChoices("ANIM_OPENALEX_USER_AGENT", "OPENALEX_USER_AGENT"),
+    )
+    OPENALEX_EMAIL: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ANIM_OPENALEX_EMAIL", "OPENALEX_EMAIL"),
+    )
+
 
 def get_settings() -> Settings:
     """Return a cached or newly instantiated Settings object."""

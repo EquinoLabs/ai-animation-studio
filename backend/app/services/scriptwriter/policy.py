@@ -280,11 +280,20 @@ STRICT ANTI-FILLER & FACTUAL RESTRAINT DIRECTIVES:
      * Break down causes, mechanisms, cognitive/biological steps, and real-world consequences in detail.
      * Contrast mechanisms with everyday examples, analogies (e.g. 'Think of it like...'), and alternative systems.
      * Explain *why* and *how* something happens, rather than only summarizing that it happened.
-3. HONEST FACTUAL BOUNDARIES:
+3. HONEST FACTUAL BOUNDARIES & ILLUSTRATIVE SCENARIO CITATION POLICY:
    - Do NOT invent historical anecdotes, fabricated quotes, imaginary dialogue, or fake statistics.
    - Distinct Narrative Layers: Clearly distinguish between factual assertions and creative framing.
      When using metaphors, analogies, or thought experiments, frame them explicitly as analogies
      (e.g. "Think of it like...", "Imagine a system where..."), never as literal historical facts.
+   - EVERYDAY EXAMPLES AND ILLUSTRATIVE SCENARIOS: Everyday examples, hypothetical scenarios, metaphors,
+     and illustrative narration (e.g. waking to an alarm clock, morning coffee, toothbrush routine)
+     are permitted for engagement, but MUST NOT receive evidence citations unless the cited research
+     excerpt explicitly documents or studies that specific everyday scenario itself.
+   - Evidence citations must substantiate the scientific, causal, or historical proposition being conveyed,
+     not the decorative illustrative vehicle.
+   - Factual principles and scientific mechanisms embedded within illustrative examples remain subject to
+     strict grounding (e.g. claiming habit cues trigger behavioral loops requires grounding, but the alarm
+     clock example itself must not cite an unrelated academic paper on habit formation).
 4. RETRIEVED DOES NOT EQUAL VERIFIED:
    - When evidence from research is provided, cite declared evidence IDs accurately.
    - Declaring an evidence ID indicates an association with a retrieved source excerpt; it does
@@ -388,7 +397,8 @@ Storytelling Architecture:
 
 Multi-Beat Narrative Outline Requirements:
 - Each section's target words require 2–4 concrete factual milestones / narrative beats, NOT a single superficial bullet.
-- Substantial sections (~150–250+ words, such as 'middle') MUST specify at least 3 distinct mechanical steps, causal transitions, or sequential developments to ensure sufficient explanatory depth.
+- Substantial sections (~150–250+ words, such as 'middle') MUST specify at least 3 distinct mechanical steps, causal transitions, or sequential developments (requiring 4–5 distinct mechanical steps / narrative beats for deep explanatory coverage) to ensure sufficient explanatory depth.
+- Moderate sections (70–149 words) require 2–3 concrete factual milestones.
 - Each milestone must describe a specific, concrete concept or causal mechanism rather than a generic summary.
 
 Section Roles & Structural Milestones:
@@ -436,7 +446,12 @@ Output strictly valid JSON matching this schema:
       "type": "middle",
       "heading": "Descriptive Middle Heading",
       "target_words": {metrics['middle_words']},
-      "factual_milestones": ["Core mechanical step 1", "Core mechanical step 2"],
+      "factual_milestones": [
+        "Core mechanical step 1: trigger or sensory cue",
+        "Core mechanical step 2: neurochemical or cognitive transition",
+        "Core mechanical step 3: routine behavioral execution",
+        "Core mechanical step 4: reinforcing feedback or reward mechanism"
+      ],
       "visual_concept": "Actionable 2D staging concept for middle",
       "evidence_ids": []
     }},
@@ -497,7 +512,10 @@ Output strictly valid JSON matching this schema:
                 f"{evidence_brief_text.strip()}\n"
                 f"--- END RESEARCH EVIDENCE BRIEF ---\n\n"
                 f"GROUNDING & CLAIM ATTRIBUTION INSTRUCTIONS:\n"
-                f"- Ground factual statements in the retrieved source excerpts from the evidence brief.\n"
+                f"- STRICT EVIDENCE CONSTRAINTS: Ground factual assertions strictly in the retrieved source excerpts from the evidence brief.\n"
+                f"- DO NOT INVENT SPECIFIC SCIENTIFIC MECHANISMS: Do NOT assert specific biological mechanisms, anatomical structures (e.g. basal ganglia, prefrontal cortex, striatum), or neurotransmitters (e.g. dopamine, serotonin) UNLESS they appear explicitly in the provided evidence excerpts above.\n"
+                f"- PRETRAINED KNOWLEDGE IS NOT EVIDENCE: Do NOT use your background knowledge to fill factual gaps. If the retrieved evidence explains neuroplasticity or habit loops generally, write engagingly about those verified concepts without fabricating unverified neurochemistry.\n"
+                f"- NO CITATION OF ILLUSTRATIVE EXAMPLES: Everyday examples, hypothetical scenarios, metaphors, and illustrative narration (e.g. waking to alarms, toothbrush routines) must NOT cite evidence IDs unless the cited excerpt explicitly documents that scenario. Citations must support the scientific or factual proposition.\n"
                 f"- Citing an evidence ID in 'evidence_ids' declares a reference to a retrieved source excerpt. "
                 f"It does NOT imply that the claim has been storage-validated or substantively verified (which is assessed downstream).\n"
                 f"- In the 'claims' array, list every discrete factual assertion made in the narration.\n"
@@ -748,7 +766,10 @@ Output strictly valid JSON matching the 5-section Script schema (hook, setup, mi
                 f"\n--- RESEARCH EVIDENCE & GROUNDING ---\n"
                 f"{brief_snippet}"
                 f"GROUNDING & CLAIM ATTRIBUTION INSTRUCTIONS:\n"
-                f"- Ground factual statements in the provided source excerpts.\n"
+                f"- STRICT EVIDENCE CONSTRAINTS: Ground factual assertions strictly in the provided source excerpts above.\n"
+                f"- DO NOT INVENT SPECIFIC SCIENTIFIC MECHANISMS: Do NOT assert specific biological mechanisms, anatomical structures (e.g. basal ganglia, prefrontal cortex, striatum), or neurotransmitters (e.g. dopamine, serotonin) UNLESS they appear explicitly in the provided evidence excerpts above.\n"
+                f"- PRETRAINED KNOWLEDGE IS NOT EVIDENCE: Do NOT use your background knowledge to fill factual gaps. If the retrieved evidence explains neuroplasticity or habit loops generally, write engagingly about those verified concepts without fabricating unverified neurochemistry.\n"
+                f"- NO CITATION OF ILLUSTRATIVE EXAMPLES: Everyday examples, hypothetical scenarios, metaphors, and illustrative narration (e.g. waking to alarms, toothbrush routines) must NOT cite evidence IDs unless the cited excerpt explicitly documents that scenario. Citations must support the scientific or factual proposition.\n"
                 f"- Permitted evidence IDs: {permitted}\n"
                 f"- In the 'claims' array, list every discrete factual assertion made in this section's narration.\n"
                 f"- For each claim, set 'claim_text' and reference declared evidence IDs in 'evidence_ids' (e.g. ['evi_...']).\n"

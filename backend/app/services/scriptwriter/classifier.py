@@ -23,6 +23,10 @@ _HIGH_RISK_SCIENTIFIC_TERMS: Set[str] = {
     "black hole", "supernova", "light year", "light-year", "speed of light",
     "plate tectonics", "continental drift", "subduction", "fossil",
     "mechanism", "mechanisms",
+    # Biological, anatomical, and neurological entities
+    "brain", "neural", "neuron", "neurons", "cortex", "prefrontal",
+    "basal ganglia", "striatum", "dopamine", "synapse", "synapses",
+    "synaptic", "neurotransmitter", "neurotransmitters", "circuits", "circuitry",
 }
 
 _HIGH_RISK_CAUSAL_TERMS: Set[str] = {
@@ -115,6 +119,17 @@ def classify_claim_risk(
     )
 
     if is_metaphor or is_rhetorical_question:
+        # Guard against embedded factual/empirical assertions inside a metaphorical frame
+        # (e.g. anatomical structures, biological mechanisms, multipliers, or empirical claims)
+        has_embedded_fact = bool(
+            re.search(
+                r"\b(?:doubles?|triples?|quadruples?|speeds?|processing\s+speed|memory|cognitive|"
+                r"biological|anatomical|physiological|circuits?|transmitters?|receptors?)\b",
+                lower_text,
+            )
+        )
+        if has_embedded_fact:
+            return "high"
         return "creative_flexibility"
 
     return "normal"

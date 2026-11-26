@@ -422,7 +422,7 @@ class MockLLMProvider(LLMProvider):
         # 8. Fallback deterministic generator for fact-check batch payloads
         if schema is BatchFactCheckResponsePayload or schema.__name__ == "BatchFactCheckResponsePayload":
             claim_blocks = re.findall(
-                r"CLAIM ID:\s*([a-zA-Z0-9_-]+).*?(?:PROPOSITION:\s*\"(.*?)\").*?(?:RISK LEVEL:\s*(\w+)).*?PERMITTED EVIDENCE:\s*(.*?)(?=\n--- CLAIM|\n=== END BATCH|\Z)",
+                r"CLAIM ID:\s*([a-zA-Z0-9_-]+).*?(?:PROPOSITION:\s*\"(.*?)\").*?(?:RISK LEVEL:\s*(\w+)).*?PERMITTED EVIDENCE.*?:\s*(.*?)(?=\n--- CLAIM|\n=== END|\Z)",
                 prompt,
                 re.DOTALL,
             )
@@ -454,7 +454,7 @@ class MockLLMProvider(LLMProvider):
             cur_narration = narration_match.group(1) if narration_match else "Repaired narration."
 
             claim_blocks = re.findall(
-                r"CLAIM ID:\s*([a-zA-Z0-9_-]+).*?(?:CURRENT PROPOSITION:\s*\"(.*?)\").*?(?:FACT-CHECK STATUS:\s*(\w+)).*?PERMITTED EVIDENCE FOR REPAIR:\s*(.*?)(?=\n--- CLAIM|\n=== END REQUEST|\Z)",
+                r"CLAIM ID:\s*([a-zA-Z0-9_-]+).*?(?:(?:CURRENT|ABSTRACT CLAIM)\s+PROPOSITION.*?:\s*\"(.*?)\").*?(?:FACT-CHECK STATUS:\s*(\w+)).*?PERMITTED EVIDENCE FOR REPAIR:\s*(.*?)(?=\n--- CLAIM|\n=== END REQUEST|\Z)",
                 prompt,
                 re.DOTALL,
             )
@@ -469,7 +469,11 @@ class MockLLMProvider(LLMProvider):
                 elif status == "contradicted":
                     if eids:
                         action = "rephrase"
-                        rev_text = f"Alternative verified fact: {prop.rstrip('.')} corrected."
+                        excerpt_match = re.search(r'Excerpt:\s*"(.*?)"', ev_text)
+                        if excerpt_match and excerpt_match.group(1).strip():
+                            rev_text = excerpt_match.group(1).strip().rstrip(".") + "."
+                        else:
+                            rev_text = f"Alternative verified fact: {prop.rstrip('.')} corrected."
                         chosen_eids = eids[:1]
                     else:
                         action = "remove"
@@ -478,7 +482,11 @@ class MockLLMProvider(LLMProvider):
                 elif status == "unsupported":
                     if eids:
                         action = "rephrase"
-                        rev_text = f"Supported correction: {prop.rstrip('.')}."
+                        excerpt_match = re.search(r'Excerpt:\s*"(.*?)"', ev_text)
+                        if excerpt_match and excerpt_match.group(1).strip():
+                            rev_text = excerpt_match.group(1).strip().rstrip(".") + "."
+                        else:
+                            rev_text = f"Supported correction: {prop.rstrip('.')}."
                         chosen_eids = eids[:1]
                     else:
                         action = "remove"

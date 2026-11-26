@@ -107,12 +107,12 @@ class MockExtractTool(ResearchTool):
             raw_content = self._canned_content
         else:
             raw_content = (
-                f"# Source Article from {args.url}\n\n"
-                "## Historical Foundation\n"
-                "Barter systems required a double coincidence of wants, which created high transaction frictions.\n"
-                "Commodity monies like shells, barley, and cattle emerged as early universal mediums of exchange.\n\n"
-                "## Standardization and Metal\n"
-                "Electrum coins in Lydia standardized weight and purity, reducing the need for constant assaying.\n"
+                f"# Historical Currency Source Article from {args.url}\n\n"
+                "## Historical Foundation of Currency\n"
+                "Barter systems required a double coincidence of wants, which created high transaction frictions in ancient currency history.\n"
+                "Commodity monies like shells, barley, and cattle emerged as early universal mediums of currency exchange.\n\n"
+                "## Standardization and Metal Coinage\n"
+                "Electrum coins in Lydia standardized weight and purity, establishing historical coinage across regional currency commerce.\n"
             )
 
         bounded_text, truncated = session.consume_content_budget(raw_content)

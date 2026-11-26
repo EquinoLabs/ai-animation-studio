@@ -504,9 +504,17 @@ class ScriptDraftGenerator:
             )
 
             # Bounded section expansion fallback:
-            # If narration falls substantially below target (<50% of target_words and <60 words)
+            # Trigger expansion if section is proportionally underdeveloped:
+            # - wc < 0.65 * target_words for target >= 120 words
+            # - wc < 0.5 * target_words
+            # - wc < 40 words for target >= 60 words
             wc = count_words(section_payload.narration)
-            if wc < (0.5 * out_sec.target_words) and wc < 60:
+            should_expand = (
+                (out_sec.target_words >= 120 and wc < (0.65 * out_sec.target_words))
+                or (wc < (0.5 * out_sec.target_words))
+                or (out_sec.target_words >= 60 and wc < 40)
+            )
+            if should_expand:
                 section_payload = self._expand_underdeveloped_section(
                     section_payload=section_payload,
                     out_sec=out_sec,

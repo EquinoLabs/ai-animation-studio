@@ -132,6 +132,57 @@ def _is_same_factual_proposition(text_a: str, text_b: str) -> bool:
     return False
 
 
+def _resolve_claim_narration_sentence(claim_text: str, narration: str) -> Optional[str]:
+    """Deterministically identify the specific narration sentence corresponding to a claim proposition."""
+    if not claim_text or not narration:
+        return None
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", narration) if s.strip()]
+    if not sentences:
+        return None
+
+    clean_prop = claim_text.strip()
+    # 1. Exact sentence inclusion
+    for s in sentences:
+        if clean_prop == s or clean_prop in s or s in clean_prop:
+            return s
+
+    # 2. Content word overlap (ignoring common stopwords)
+    prop_tokens = [
+        w for w in re.findall(r"\b[a-zA-Z]{3,}\b", clean_prop.lower())
+        if w not in _PROPOSITION_STOPWORDS
+    ]
+    if not prop_tokens:
+        return None
+
+    def _stem(w: str) -> str:
+        for suf in ("ing", "tion", "ions", "ment", "ness", "ies", "es", "ed", "s"):
+            if w.endswith(suf) and len(w) - len(suf) >= 3:
+                return w[:-len(suf)]
+        return w
+
+    prop_roots = set(_stem(w) for w in prop_tokens)
+
+    scored = []
+    for s in sentences:
+        s_words = [
+            w for w in re.findall(r"\b[a-zA-Z]{3,}\b", s.lower())
+            if w not in _PROPOSITION_STOPWORDS
+        ]
+        s_roots = set(_stem(w) for w in s_words)
+        overlap = prop_roots & s_roots
+        scored.append((len(overlap), len(s_words), s))
+
+    scored.sort(key=lambda x: (x[0], -x[1]), reverse=True)
+    best_score, _, best_sent = scored[0]
+
+    # Reliable threshold: at least 2 distinct root matches
+    if best_score >= 2:
+        return best_sent
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Structured LLM Schemas for Surgical Section Repair
 # ---------------------------------------------------------------------------
@@ -154,8 +205,9 @@ class ClaimRepairPayload(BaseModel):
     evidence_ids: List[str] = Field(
         default_factory=list, description="Permitted evidence IDs supporting the repaired proposition"
     )
-    explanation: str = Field(
-        ..., min_length=1, description="Explanation of how the repair addresses the assessment"
+    explanation: Optional[str] = Field(
+        default="Surgical factual repair applied per fact-check assessment.",
+        description="Explanation of how the repair addresses the assessment",
     )
 
     @field_validator("claim_id")
@@ -168,10 +220,10 @@ class ClaimRepairPayload(BaseModel):
 
     @field_validator("explanation")
     @classmethod
-    def validate_explanation(cls, v: str) -> str:
+    def validate_explanation(cls, v: Optional[str]) -> str:
         clean = (v or "").strip()
         if not clean:
-            raise ValueError("explanation cannot be blank.")
+            return "Surgical factual repair applied per fact-check assessment."
         return clean
 
 
@@ -239,10 +291,13 @@ Your task is to repair ONLY the specified problematic factual claims within a si
 SURGICAL REPAIR RULES:
 1. MINIMAL EDITING: Modify ONLY the sentences containing the target claims. Do NOT rewrite, polish, or rephrase unrelated sentences in the section.
 2. PRESERVE UNRELATED CONTENT: Keep all surrounding text, hooks, transitions, and questions intact.
-3. REPAIR ACTIONS:
+3. REPAIR ACTIONS & UNSUPPORTED SPECIFICITY POLICY:
    - "qualify": If the claim is partially supported, narrow or qualify the assertion so that it is strictly substantiated by the permitted evidence.
-   - "rephrase": If the claim is contradicted or unsupported, replace the false or ungrounded assertion with a verified factual statement drawn from the permitted evidence.
-   - "remove": If no supported alternative exists in the permitted evidence, smoothly delete the false or unsupported factual assertion from the narration, ensuring surrounding text remains grammatically correct and coherent. (Set revised_claim_text=None and evidence_ids=[]).
+     CRITICAL: If a claim asserts a specific anatomical structure (e.g. prefrontal cortex, basal ganglia), biological mechanism, or specific entity absent from permitted evidence, you must NOT preserve it by merely hedging ("may", "could", "possibly", "might", "while not explicitly mentioned").
+     Hedging unsupported specifics is STRICTLY PROHIBITED.
+     Instead, use "rephrase" with a directly supported general explanation (e.g. "brain regions" or "neural networks" supported by general evidence), or use "remove".
+   - "rephrase": If the claim is contradicted or unsupported, replace the ungrounded assertion with a verified factual statement drawn directly from the permitted evidence.
+   - "remove": If no supported alternative exists in the permitted evidence, smoothly delete the false or unsupported factual assertion from the narration, ensuring surrounding text remains grammatically correct, natural, and coherent. (Set revised_claim_text=None and evidence_ids=[]).
    - "keep": If a creative expression requires no factual change, keep it.
 4. STRICT EVIDENCE PROVENANCE:
    - You may ONLY cite evidence IDs that are listed under that target claim's 'PERMITTED EVIDENCE FOR REPAIR'.
@@ -531,10 +586,13 @@ class ScriptRepairer:
         for idx, c in enumerate(target_claims, 1):
             assessment = target_assessments[c.claim_id]
             supplied_ids = supplied_eids_by_claim.get(c.claim_id, set())
+            associated_sentence = _resolve_claim_narration_sentence(c.claim_text, section.narration)
 
             lines.append(f"--- CLAIM {idx} of {len(target_claims)} ---")
             lines.append(f"CLAIM ID: {c.claim_id}")
-            lines.append(f'CURRENT PROPOSITION: "{c.claim_text}"')
+            if associated_sentence:
+                lines.append(f'TARGET NARRATION SENTENCE (Must match target_span verbatim): "{associated_sentence}"')
+            lines.append(f'CURRENT PROPOSITION (ABSTRACT CLAIM PROPOSITION to repair): "{c.claim_text}"')
             lines.append(f"RISK LEVEL: {c.risk_level}")
             lines.append(f"FACT-CHECK STATUS: {assessment.status}")
             lines.append(f'ASSESSMENT EXPLANATION: "{assessment.explanation}"')
@@ -554,7 +612,37 @@ class ScriptRepairer:
             lines.append("")
 
         lines.append("=== END REQUEST ===")
-        lines.append("Return valid JSON matching SectionRepairPayload.")
+        lines.append("")
+        lines.append("REQUIRED JSON SCHEMA FOR SectionRepairPayload:")
+        lines.append("{")
+        lines.append(f'  "section_id": "{section.id}",')
+        lines.append('  "repairs": [')
+        lines.append("    {")
+        lines.append('      "claim_id": "clm_01",')
+        lines.append('      "action": "qualify",')
+        lines.append('      "target_span": "Exact verbatim sentence from section narration being replaced",')
+        lines.append('      "replacement_span": "Replacement sentence reflecting supported evidence",')
+        lines.append('      "revised_claim_text": "Substantiated factual assertion",')
+        lines.append('      "evidence_ids": ["evi_..."],')
+        lines.append('      "explanation": "Why this repair satisfies the fact check"')
+        lines.append("    }")
+        lines.append("  ]")
+        lines.append("}")
+        lines.append("")
+        lines.append("MANDATORY RULES:")
+        lines.append("1. 'section_id' must exactly match the requested section ID.")
+        lines.append("2. In 'repairs', provide exactly one repair object for each target claim ID.")
+        lines.append("3. 'target_span' MUST be copied verbatim from TARGET NARRATION SENTENCE (or CURRENT SECTION NARRATION).")
+        lines.append("   CRITICAL: DO NOT use the ABSTRACT CLAIM PROPOSITION as 'target_span'!")
+        lines.append("   The proposition is the abstract factual meaning being evaluated, NOT the sentence in the script.")
+        lines.append("4. For action='qualify' or 'rephrase':")
+        lines.append("   - 'replacement_span' is the replacement sentence to substitute into the narration.")
+        lines.append("   - 'revised_claim_text' is the new substantiated factual proposition.")
+        lines.append("   - 'evidence_ids' must cite permitted evidence IDs supporting the revision.")
+        lines.append("   - NO HEDGING UNSUPPORTED SPECIFICS: If the original assertion names specific anatomical structures, biological mechanisms, or entities absent from the permitted evidence, do NOT merely add hedging words like 'may', 'could', 'possibly', 'might', or 'while not explicitly mentioned'. You MUST remove the unsupported detail or replace it with a directly supported general concept.")
+        lines.append("5. For action='remove':")
+        lines.append("   - set replacement_span='', revised_claim_text=null, and evidence_ids=[].")
+        lines.append("6. 'explanation' is required for each repair object.")
         return "\n".join(lines)
 
     def _invoke_section_repair_with_retry(
@@ -628,10 +716,13 @@ class ScriptRepairer:
             f"STRICT CORRECTIVE REQUIREMENTS:\n"
             f"1. section_id must be exactly '{section.id}'.\n"
             f"2. repairs must contain exactly one repair item for each of these claim IDs: {expected_ids}.\n"
-            f"3. For each claim, you may ONLY cite permitted evidence IDs:\n"
+            f"3. target_span MUST be copied verbatim from CURRENT SECTION NARRATION (or TARGET NARRATION SENTENCE).\n"
+            f"   CRITICAL: DO NOT submit the abstract claim proposition as target_span!\n"
+            f"4. explanation MUST be provided for every repair item.\n"
+            f"5. For each claim, you may ONLY cite permitted evidence IDs:\n"
             f"   Permitted evidence mapping: {allowed_ids_summary}\n"
-            f"4. If removing a claim, set revised_claim_text=null and evidence_ids=[].\n"
-            f"5. Output valid JSON adhering to SectionRepairPayload.\n"
+            f"6. If removing a claim, set replacement_span='', revised_claim_text=null and evidence_ids=[].\n"
+            f"7. Output valid JSON adhering to SectionRepairPayload.\n"
             f"--- END CORRECTION REQUIRED ---"
         )
 
@@ -697,21 +788,52 @@ class ScriptRepairer:
         # 3. Validate repair items and evidence provenance
         valid_cat_eids = catalog.valid_evidence_ids if catalog else set()
 
+        claims_by_id = {c.claim_id: c for c in target_claims}
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", section.narration) if s.strip()]
+
         for r in payload.repairs:
             if r.action not in ("qualify", "rephrase", "remove", "keep"):
                 return False, f"Invalid repair action '{r.action}' on claim '{r.claim_id}'."
 
             # Exact-span requirements:
-            # Reject repairs where target_span is empty or missing
-            target = r.target_span or ""
-            if not target.strip():
+            # 1. target_span cannot be empty
+            target = (r.target_span or "").strip()
+            if not target:
                 return False, f"Claim '{r.claim_id}' is missing mandatory target_span."
+
+            if target.startswith(('"', "'")) and target.endswith(('"', "'")) and len(target) > 2:
+                unquoted = target[1:-1].strip()
+                if unquoted in section.narration:
+                    target = unquoted
 
             if target not in section.narration and target.strip() in section.narration:
                 target = target.strip()
 
             count = section.narration.count(target)
             if count == 0:
+                orig_claim = claims_by_id.get(r.claim_id)
+                prop_text = orig_claim.claim_text.strip() if orig_claim else ""
+                associated_sent = _resolve_claim_narration_sentence(prop_text, section.narration) if prop_text else None
+
+                is_prop_confusion = False
+                if prop_text:
+                    if target == prop_text or _is_same_factual_proposition(target, prop_text):
+                        is_prop_confusion = True
+                    else:
+                        target_words = set(re.findall(r"\b[a-zA-Z]{3,}\b", target.lower()))
+                        prop_words = set(re.findall(r"\b[a-zA-Z]{3,}\b", prop_text.lower()))
+                        if target_words and len(target_words & prop_words) / len(target_words) >= 0.70:
+                            is_prop_confusion = True
+
+                if is_prop_confusion:
+                    hint = f' The exact narration sentence to copy into target_span is: "{associated_sent}".' if associated_sent else ""
+                    return (
+                        False,
+                        f"Claim '{r.claim_id}' target_span was submitted as the abstract claim proposition ('{target}'), "
+                        f"which does not occur verbatim in the section narration. The claim proposition is not the narration sentence. "
+                        f"The target span must be copied exactly from the supplied narration text.{hint}"
+                    )
+
                 return False, f"Claim '{r.claim_id}' target_span '{target}' does not occur in section narration."
             if count > 1:
                 return False, f"Claim '{r.claim_id}' target_span '{target}' occurs {count} times in section narration (ambiguous span)."
@@ -721,6 +843,37 @@ class ScriptRepairer:
                     return False, f"Claim '{r.claim_id}' has action '{r.action}' but replacement_span is empty."
                 if not r.revised_claim_text or not r.revised_claim_text.strip():
                     return False, f"Claim '{r.claim_id}' has action '{r.action}' but revised_claim_text is empty."
+
+                # Verify unsupported specific details absent from evidence are not preserved via hedging
+                supplied_for_claim = supplied_eids_by_claim.get(r.claim_id, set())
+                orig_claim = claims_by_id.get(r.claim_id)
+                if orig_claim and catalog and supplied_for_claim:
+                    combined_evidence_text = " ".join([
+                        (catalog.evidence_by_id[eid].excerpt or "").lower()
+                        for eid in supplied_for_claim
+                        if eid in catalog.evidence_by_id and catalog.evidence_by_id[eid].excerpt
+                    ])
+                    revised_text_lower = f"{r.replacement_span} {r.revised_claim_text}".lower()
+                    has_hedge = bool(re.search(
+                        r"\b(may|might|could|possibly|perhaps|while not explicitly|though not explicitly)\b",
+                        revised_text_lower,
+                    ))
+                    if has_hedge:
+                        orig_words = [
+                            w for w in re.findall(r"\b[a-zA-Z]{4,}\b", orig_claim.claim_text.lower())
+                            if w not in _PROPOSITION_STOPWORDS
+                        ]
+                        unsupported_preserved = [
+                            w for w in orig_words
+                            if w in revised_text_lower and w not in combined_evidence_text
+                        ]
+                        if unsupported_preserved:
+                            return (
+                                False,
+                                f"Claim '{r.claim_id}' preserved unsupported specific detail(s) {sorted(list(set(unsupported_preserved)))} "
+                                f"(absent from permitted evidence) using hedging. Hedging unsupported specifics is prohibited; "
+                                f"remove the unsupported detail or replace it with a directly supported general explanation.",
+                            )
 
             # Check evidence citations
             supplied_for_claim = supplied_eids_by_claim.get(r.claim_id, set())
@@ -761,9 +914,14 @@ class ScriptRepairer:
         # 1. Collect candidate spans for modify/remove actions
         span_candidates = []
         for r in payload.repairs:
-            target = r.target_span or ""
+            target = (r.target_span or "").strip()
+            if target.startswith(('"', "'")) and target.endswith(('"', "'")) and len(target) > 2:
+                unquoted = target[1:-1].strip()
+                if unquoted in section.narration:
+                    target = unquoted
             if target not in section.narration and target.strip() in section.narration:
                 target = target.strip()
+            r.target_span = target
 
             count = section.narration.count(target)
             if count == 1 and r.action in ("qualify", "rephrase", "remove"):
@@ -811,7 +969,11 @@ class ScriptRepairer:
             orig_claim = claims_by_id[r.claim_id]
             orig_assessment = target_assessments[r.claim_id]
 
-            target = r.target_span or ""
+            target = (r.target_span or "").strip()
+            if target.startswith(('"', "'")) and target.endswith(('"', "'")) and len(target) > 2:
+                unquoted = target[1:-1].strip()
+                if unquoted in section.narration:
+                    target = unquoted
             if target not in section.narration and target.strip() in section.narration:
                 target = target.strip()
             count = section.narration.count(target)

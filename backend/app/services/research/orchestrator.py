@@ -18,6 +18,8 @@ from backend.app.domain.research import (
     ResearchRun,
     ResearchRunStatus,
     SourceRecord,
+    check_topical_relevance,
+    extract_topic_tokens_and_stems,
     utc_now,
 )
 from backend.app.services.project.service import ProjectNotFoundError, ProjectSecurityError
@@ -213,8 +215,37 @@ def is_byline_or_metadata(text: str) -> bool:
     return False
 
 
-def score_candidate_paragraph(paragraph: str, current_heading: Optional[str]) -> float:
-    """Score a candidate markdown paragraph for substantive educational evidence quality.
+PROMOTIONAL_MARKETING_PATTERNS = [
+    re.compile(r"\b(raise|raising)\s+capital\b", re.IGNORECASE),
+    re.compile(r"\b(fund|funding)\s+(large\s+)?projects?\b", re.IGNORECASE),
+    re.compile(r"\b(pitch\s+deck|financial\s+model|whitepapers?)\b", re.IGNORECASE),
+    re.compile(r"\b(angel\s+investors?|vcs?|venture\s+capital)\b", re.IGNORECASE),
+    re.compile(r"\b(monthly\s+burn\s+rate|annual\s+income)\b", re.IGNORECASE),
+    re.compile(r"\b(sales\s+consulting|sales\s+strategy|content\s+marketing|seo\s+services)\b", re.IGNORECASE),
+    re.compile(r"\b(free\s+help\s+and\s+discounts?|free\s+\$\d+k\s+business\s+package)\b", re.IGNORECASE),
+    re.compile(r"\b(become\s+a\s+partner|franchise\s+partner)\b", re.IGNORECASE),
+    re.compile(r"\b(book\s+a\s+demo|schedule\s+a\s+consultation|contact\s+our\s+sales\s+team)\b", re.IGNORECASE),
+    re.compile(r"\b(subscribe\s+now\s+for|pricing\s+plans?|get\s+\d+%\s+discount)\b", re.IGNORECASE),
+    re.compile(r"\bwe\s+help\s+large\s+projects\s+worldwide\b", re.IGNORECASE),
+]
+
+GENERIC_ROADMAP_PATTERNS = [
+    re.compile(r"\bin\s+this\s+(article|post|guide|paper|section|video),?\s+we\s+will\s+(explore|discuss|examine|cover|delve|look\s+at)\b", re.IGNORECASE),
+    re.compile(r"\bstay\s+tuned\s+to\s+(discover|learn|see|find\s+out)\b", re.IGNORECASE),
+    re.compile(r"\bwe\s+will\s+also\s+discuss\s+effective\s+strategies\b", re.IGNORECASE),
+    re.compile(r"\bin\s+the\s+following\s+sections?,?\s+we\s+will\b", re.IGNORECASE),
+    re.compile(r"\blet\s+us\s+begin\s+by\s+exploring\b", re.IGNORECASE),
+]
+
+
+def score_candidate_paragraph(
+    paragraph: str,
+    current_heading: Optional[str] = None,
+    query_text: Optional[str] = None,
+    topic: Optional[str] = None,
+    target_question: Optional[str] = None,
+) -> float:
+    """Score a candidate markdown paragraph for substantive educational evidence quality and topic relevance.
 
     Returns a score > 0 for valid substantive passages, or <= 0 for invalid/chrome/gatekeeper blocks.
     """
@@ -239,6 +270,10 @@ def score_candidate_paragraph(paragraph: str, current_heading: Optional[str]) ->
     # 4. Byline / metadata check
     if is_byline_or_metadata(stripped):
         return -100.0
+
+    # 5. Promotional / commercial copy rejection (immediate disqualification)
+    if any(pattern.search(stripped) for pattern in PROMOTIONAL_MARKETING_PATTERNS):
+        return -150.0
 
     # Clean images from paragraph for word/sentence evaluation
     text_content = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", stripped).strip()
@@ -266,6 +301,10 @@ def score_candidate_paragraph(paragraph: str, current_heading: Optional[str]) ->
 
     score = 10.0
 
+    # 6. Generic article roadmap penalty
+    if any(pattern.search(stripped) for pattern in GENERIC_ROADMAP_PATTERNS):
+        score -= 40.0
+
     # Ideal length bonus (30 to 150 words)
     if 30 <= word_count <= 150:
         score += 25.0
@@ -285,16 +324,45 @@ def score_candidate_paragraph(paragraph: str, current_heading: Optional[str]) ->
     commas = text_content.count(",")
     score += min(5.0, commas * 1.0)
 
+    # 7. Topic & Query Relevance Evaluation & Gate
+    tokens, stems = extract_topic_tokens_and_stems(query_text, topic, target_question)
+    if tokens or stems:
+        is_relevant, matched_tokens, matched_heading_tokens = check_topical_relevance(
+            text=text_content,
+            heading=current_heading,
+            tokens=tokens,
+            stems=stems,
+            topic=topic,
+        )
+
+        # TOPICAL RELEVANCE GATE:
+        # A positive prose-quality score alone must NEVER make an unrelated passage eligible.
+        # The passage must demonstrate meaningful topical relevance to be eligible as evidence.
+        if not is_relevant:
+            return -100.0
+
+        # Reward substantive topic relevance
+        score += min(35.0, len(matched_tokens) * 7.0)
+        score += min(15.0, len(matched_heading_tokens) * 5.0)
+
+        # Keyword stuffing penalty: repeats query words without substantive lexical diversity
+        if len(matched_tokens) >= 3 and len(set(words)) < (len(words) * 0.4):
+            score -= 25.0
+
     return score
 
 
 def extract_verbatim_evidence(
-    content: str, max_chars: int = 1000
+    content: str,
+    max_chars: int = 1000,
+    query_text: Optional[str] = None,
+    topic: Optional[str] = None,
+    target_question: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Extract a non-empty, substantive verbatim passage and structural locator from markdown content.
 
-    Rejects cookie/bot challenges, navigation chrome, bylines, and boilerplate.
-    Returns (None, None) if no substantive passage passes quality thresholds.
+    Rejects cookie/bot challenges, navigation chrome, bylines, promotional copy, and boilerplate.
+    Returns (None, None) if no substantive passage passes quality and relevance thresholds.
     """
     if not content or not content.strip():
         return None, None
@@ -339,7 +407,13 @@ def extract_verbatim_evidence(
     best_score: float = 0.0
 
     for para_text, heading in candidate_paragraphs:
-        score = score_candidate_paragraph(para_text, heading)
+        score = score_candidate_paragraph(
+            para_text,
+            current_heading=heading,
+            query_text=query_text,
+            topic=topic,
+            target_question=target_question,
+        )
         if score > best_score:
             best_score = score
             best_paragraph = para_text
@@ -367,6 +441,12 @@ class ResearchOrchestrator:
     DEFAULT_TOOL_MAP = {
         "web_search": "tavily_search",
         "web_extract": "firecrawl_extract",
+        "wiki_search": "wikimedia_search",
+        "wiki_extract": "wikimedia_extract",
+        "archive_search": "internet_archive_search",
+        "archive_extract": "internet_archive_extract",
+        "academic_search": "openalex_search",
+        "academic_extract": "openalex_extract",
     }
 
     def __init__(
@@ -708,8 +788,24 @@ class ResearchOrchestrator:
             except Exception as err:
                 self._handle_persistence_failure(project_id, run, f"Failed to persist extracted content: {err}")
 
-            # Extract bounded verbatim excerpt and structural locator
-            excerpt, locator = extract_verbatim_evidence(content_text, max_chars=1000)
+            # Resolve query details for topic relevance evaluation
+            associated_qid = executing_qid or source_to_query_map.get(source.source_id)
+            query_obj = next((q for q in plan.planned_queries if q.query_id == associated_qid), None)
+            query_text = query_obj.query_text if query_obj else None
+            target_question = (
+                query_obj.target_question
+                if query_obj and query_obj.target_question
+                else (source_to_target_question.get(source.source_id) or "General Inquiry")
+            )
+
+            # Extract bounded verbatim excerpt and structural locator with topic and query relevance
+            excerpt, locator = extract_verbatim_evidence(
+                content_text,
+                max_chars=1000,
+                query_text=query_text,
+                topic=plan.topic,
+                target_question=target_question,
+            )
             if not excerpt or not excerpt.strip():
                 logger.info(
                     "Extraction from '%s' yielded no substantive article content (rejected chrome/boilerplate).",
@@ -723,11 +819,6 @@ class ResearchOrchestrator:
                 continue
 
             # Retrieve associated inquiry question target (never a fabricated factual claim)
-            associated_qid = executing_qid or source_to_query_map.get(source.source_id)
-            target_question = next(
-                (q.target_question for q in plan.planned_queries if q.query_id == associated_qid),
-                source_to_target_question.get(source.source_id) or "General Inquiry",
-            )
             inquiry_target = target_question or "General Inquiry"
 
             evidence_rec = EvidenceRecord(
@@ -740,6 +831,7 @@ class ResearchOrchestrator:
                 locator=locator,
                 target_claim=inquiry_target,
                 status="retrieved",
+                selection_rationale=f"topic_relevance_verified: query='{query_text or ''}', target='{inquiry_target}'",
                 created_at=utc_now(),
             )
 

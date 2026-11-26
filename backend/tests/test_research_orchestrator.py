@@ -612,7 +612,11 @@ def test_exact_fetch_url_validated_and_passed_to_extractor(project_env, monkeypa
 
     def spy_extract_handler(args, session):
         extracted_urls.append(args.url)
-        return "# Article 99\n\nContent for article 99."
+        return (
+            "# Article 99: Origins of Currency\n\n"
+            "Standardized coinage and historical currency mechanisms transformed ancient commerce, "
+            "replacing barter systems with minted metal tokens across Mediterranean trade networks."
+        )
 
     spy_search = MockSearchTool(name="tavily_search", canned_results=canned)
     spy_extract = MockExtractTool(name="firecrawl_extract", custom_handler=spy_extract_handler)

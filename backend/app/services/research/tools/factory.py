@@ -10,8 +10,20 @@ from backend.app.services.research.tools.base import (
     ToolRegistry,
 )
 from backend.app.services.research.tools.firecrawl import FirecrawlExtractTool
+from backend.app.services.research.tools.internet_archive import (
+    InternetArchiveExtractTool,
+    InternetArchiveSearchTool,
+)
 from backend.app.services.research.tools.mock import MockExtractTool, MockSearchTool
+from backend.app.services.research.tools.openalex import (
+    OpenAlexExtractTool,
+    OpenAlexSearchTool,
+)
 from backend.app.services.research.tools.tavily import TavilySearchTool
+from backend.app.services.research.tools.wikimedia import (
+    WikimediaExtractTool,
+    WikimediaSearchTool,
+)
 
 if TYPE_CHECKING:
     from backend.app.llm import LLMProvider
@@ -81,9 +93,21 @@ class ResearchToolFactory:
 
         tavily_tool = TavilySearchTool(settings=cfg, client=client)
         firecrawl_tool = FirecrawlExtractTool(settings=cfg, client=client)
+        wikimedia_search_tool = WikimediaSearchTool(settings=cfg, client=client)
+        wikimedia_extract_tool = WikimediaExtractTool(settings=cfg, client=client)
+        archive_search_tool = InternetArchiveSearchTool(settings=cfg, client=client)
+        archive_extract_tool = InternetArchiveExtractTool(settings=cfg, client=client)
+        openalex_search_tool = OpenAlexSearchTool(settings=cfg, client=client)
+        openalex_extract_tool = OpenAlexExtractTool(settings=cfg, client=client)
 
         registry.register(tavily_tool)
         registry.register(firecrawl_tool)
+        registry.register(wikimedia_search_tool)
+        registry.register(wikimedia_extract_tool)
+        registry.register(archive_search_tool)
+        registry.register(archive_extract_tool)
+        registry.register(openalex_search_tool)
+        registry.register(openalex_extract_tool)
         return registry
 
     @classmethod

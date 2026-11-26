@@ -25,22 +25,49 @@ from backend.app.services.research.tools.firecrawl import (
     FirecrawlExtractArgs,
     FirecrawlExtractTool,
 )
+from backend.app.services.research.tools.internet_archive import (
+    InternetArchiveExtractArgs,
+    InternetArchiveExtractTool,
+    InternetArchiveSearchArgs,
+    InternetArchiveSearchTool,
+)
 from backend.app.services.research.tools.mock import (
     MockExtractTool,
     MockSearchTool,
 )
+from backend.app.services.research.tools.openalex import (
+    OpenAlexExtractArgs,
+    OpenAlexExtractTool,
+    OpenAlexSearchArgs,
+    OpenAlexSearchTool,
+    reconstruct_abstract,
+)
 from backend.app.services.research.tools.tavily import (
     TavilySearchArgs,
     TavilySearchTool,
+)
+from backend.app.services.research.tools.wikimedia import (
+    WikimediaExtractArgs,
+    WikimediaExtractTool,
+    WikimediaSearchArgs,
+    WikimediaSearchTool,
 )
 
 __all__ = [
     "ExtractToolResult",
     "FirecrawlExtractArgs",
     "FirecrawlExtractTool",
+    "InternetArchiveExtractArgs",
+    "InternetArchiveExtractTool",
+    "InternetArchiveSearchArgs",
+    "InternetArchiveSearchTool",
     "MissingCredentialsError",
     "MockExtractTool",
     "MockSearchTool",
+    "OpenAlexExtractArgs",
+    "OpenAlexExtractTool",
+    "OpenAlexSearchArgs",
+    "OpenAlexSearchTool",
     "ResearchBudgetExceededError",
     "ResearchDeadlineExceededError",
     "ResearchExecutionSession",
@@ -58,6 +85,11 @@ __all__ = [
     "ToolValidationError",
     "UnknownToolError",
     "UnsafeURLError",
+    "WikimediaExtractArgs",
+    "WikimediaExtractTool",
+    "WikimediaSearchArgs",
+    "WikimediaSearchTool",
+    "reconstruct_abstract",
     "sanitize_secret",
     "validate_url_safety",
 ]

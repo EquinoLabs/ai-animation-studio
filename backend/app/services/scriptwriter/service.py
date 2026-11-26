@@ -193,7 +193,7 @@ class ScriptService:
     ) -> None:
         self.settings = settings or get_settings()
         self.words_per_minute = getattr(self.settings, "WORDS_PER_MINUTE", 140)
-        self.project_service = project_service or ProjectService(settings=self.settings)
+        self.project_service = project_service or ProjectService(projects_root=Path(self.settings.PROJECTS_DIR))
         self.llm_provider = llm_provider or get_llm_provider(settings=self.settings)
         self.research_storage = research_storage or ResearchStorageService(settings=self.settings)
         self.research_orchestrator = research_orchestrator
@@ -212,6 +212,7 @@ class ScriptService:
         self.fact_checker = fact_checker or ScriptFactChecker(
             llm_provider=self.llm_provider,
             settings=self.settings,
+            max_batch_size=1,
             discover_candidates=True,
         )
         self.repairer = repairer or ScriptRepairer(
@@ -1181,7 +1182,7 @@ class ScriptService:
                 repaired.project_id = project_id
                 repaired.status = "draft"
                 repaired.updated_at = utc_now()
-                populate_script_duration_metrics(repaired, words_per_minute=self.words_per_minute, evidence_catalog=catalog)
+                populate_script_duration_metrics(repaired, words_per_minute=self.words_per_minute, evidence_catalog=rev_catalog)
 
                 repair_report = repair_result.fact_check_report
                 repair_report.script_version = v_rep

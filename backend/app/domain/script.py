@@ -2,11 +2,15 @@
 
 from datetime import datetime, timezone
 import re
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 import uuid
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.app.domain.fact_check import ClaimAssessmentStatus, ClaimRiskLevel
+from backend.app.domain.research import (
+    check_topical_relevance,
+    extract_topic_tokens_and_stems,
+)
 
 
 def utc_now() -> datetime:
@@ -91,6 +95,84 @@ class DurationComplianceReport(BaseModel):
     )
 
 
+_PROMOTIONAL_PATTERNS = [
+    re.compile(r"\b(raise|raising)\s+capital\b", re.IGNORECASE),
+    re.compile(r"\b(fund|funding)\s+(large\s+)?projects?\b", re.IGNORECASE),
+    re.compile(r"\b(pitch\s+deck|financial\s+model|whitepapers?)\b", re.IGNORECASE),
+    re.compile(r"\b(angel\s+investors?|vcs?|venture\s+capital)\b", re.IGNORECASE),
+    re.compile(r"\b(monthly\s+burn\s+rate|annual\s+income)\b", re.IGNORECASE),
+    re.compile(r"\b(sales\s+consulting|sales\s+strategy|content\s+marketing|seo\s+services)\b", re.IGNORECASE),
+    re.compile(r"\b(free\s+help\s+and\s+discounts?|free\s+\$\d+k\s+business\s+package)\b", re.IGNORECASE),
+    re.compile(r"\b(become\s+a\s+partner|franchise\s+partner)\b", re.IGNORECASE),
+    re.compile(r"\b(book\s+a\s+demo|schedule\s+a\s+consultation|contact\s+our\s+sales\s+team)\b", re.IGNORECASE),
+    re.compile(r"\b(subscribe\s+now\s+for|pricing\s+plans?|get\s+\d+%\s+discount)\b", re.IGNORECASE),
+    re.compile(r"\bwe\s+help\s+large\s+projects\s+worldwide\b", re.IGNORECASE),
+]
+
+_GENERIC_ROADMAP_PATTERNS = [
+    re.compile(r"\bin\s+this\s+(article|post|guide|paper|section|video),?\s+we\s+will\s+(explore|discuss|examine|cover|delve|look\s+at)\b", re.IGNORECASE),
+    re.compile(r"\bstay\s+tuned\s+to\s+(discover|learn|see|find\s+out)\b", re.IGNORECASE),
+    re.compile(r"\bwe\s+will\s+also\s+discuss\s+effective\s+strategies\b", re.IGNORECASE),
+    re.compile(r"\bin\s+the\s+following\s+sections?,?\s+we\s+will\b", re.IGNORECASE),
+    re.compile(r"\blet\s+us\s+begin\s+by\s+exploring\b", re.IGNORECASE),
+]
+
+
+def _evaluate_evidence_record_qualification(
+    record: Any,
+    topic_tokens: Optional[Set[str]] = None,
+    topic_stems: Optional[Set[str]] = None,
+) -> Tuple[bool, str]:
+    """Evaluate whether an evidence record qualifies as substantive and topic-relevant.
+
+    Returns:
+        (is_qualifying, exclusion_reason)
+        Where exclusion_reason is:
+          - "" (qualifying)
+          - "promotional_or_roadmap" (matches promotional or roadmap patterns)
+          - "insufficient_length" (empty, whitespace, or < 20 words)
+          - "substantive_off_topic" (substantive >= 20 words and non-promotional, but fails topical relevance check)
+    """
+    excerpt = (getattr(record, "excerpt", "") or "").strip()
+    if not excerpt:
+        return False, "insufficient_length"
+
+    # 1. Promotional or generic roadmap
+    if any(p.search(excerpt) for p in _PROMOTIONAL_PATTERNS + _GENERIC_ROADMAP_PATTERNS):
+        return False, "promotional_or_roadmap"
+
+    # 2. Insufficient length
+    words = excerpt.split()
+    if len(words) < 20:
+        return False, "insufficient_length"
+
+    # 3. Topical relevance check (when topic tokens or stems are provided)
+    if topic_tokens or topic_stems:
+        locator = getattr(record, "locator", None)
+        target_claim = getattr(record, "target_claim", None)
+        heading = locator or target_claim
+        is_rel, _, _ = check_topical_relevance(
+            text=excerpt,
+            heading=heading,
+            tokens=topic_tokens or set(),
+            stems=topic_stems or set(),
+        )
+        if not is_rel:
+            return False, "substantive_off_topic"
+
+    return True, ""
+
+
+def _is_substantive_evidence_record(record: Any, topic: Optional[str] = None) -> bool:
+    """Determine whether an evidence record contains substantive and topic-relevant factual evidence."""
+    tokens: Set[str] = set()
+    stems: Set[str] = set()
+    if topic:
+        tokens, stems = extract_topic_tokens_and_stems(topic)
+    qualifying, _ = _evaluate_evidence_record_qualification(record, tokens, stems)
+    return qualifying
+
+
 def populate_script_duration_metrics(
     script: "Script",
     words_per_minute: int = DEFAULT_WORDS_PER_MINUTE,
@@ -129,11 +211,58 @@ def populate_script_duration_metrics(
 
         if records is not None:
             total_records = len(records)
+            topic_str = (script.topic or "").strip()
+            if not topic_str and script.outline and script.outline.topic:
+                topic_str = script.outline.topic.strip()
+            if not topic_str and evidence_catalog and getattr(evidence_catalog, "topic", None):
+                topic_str = str(evidence_catalog.topic).strip()
+
+            topic_tokens: Set[str] = set()
+            topic_stems: Set[str] = set()
+            if topic_str:
+                topic_tokens, topic_stems = extract_topic_tokens_and_stems(topic_str)
+
+            qualifying_records: List[Any] = []
+            promotional_records: List[Any] = []
+            off_topic_records: List[Any] = []
+            insufficient_records: List[Any] = []
+
+            for r in records:
+                is_qual, reason = _evaluate_evidence_record_qualification(r, topic_tokens, topic_stems)
+                if is_qual:
+                    qualifying_records.append(r)
+                elif reason == "promotional_or_roadmap":
+                    promotional_records.append(r)
+                elif reason == "substantive_off_topic":
+                    off_topic_records.append(r)
+                else:
+                    insufficient_records.append(r)
+
+            qualifying_count = len(qualifying_records)
+            distinct_qualifying_sources = len({getattr(r, "source_id", None) for r in qualifying_records if getattr(r, "source_id", None)})
+            distinct_qualifying_queries = len({getattr(r, "query_id", None) for r in qualifying_records if getattr(r, "query_id", None)})
+            qualifying_excerpt_words = sum(len((getattr(r, "excerpt", "") or "").split()) for r in qualifying_records)
+
+            total_excerpt_words = sum(len((getattr(r, "excerpt", "") or "").split()) for r in records)
             distinct_sources = len({getattr(r, "source_id", None) for r in records if getattr(r, "source_id", None)})
             distinct_queries = len({getattr(r, "query_id", None) for r in records if getattr(r, "query_id", None)})
-            total_excerpt_words = sum(len((getattr(r, "excerpt", "") or "").split()) for r in records)
             tokens = [w.lower() for r in records for w in re.findall(r"\b[a-zA-Z]{3,}\b", getattr(r, "excerpt", "") or "")]
             vocab_ratio = (len(set(tokens)) / max(1, len(tokens)))
+
+            non_sub_count = total_records - qualifying_count
+            exclusion_parts: List[str] = []
+            if promotional_records:
+                exclusion_parts.append(f"{len(promotional_records)} promotional or generic-roadmap record(s) excluded")
+            if off_topic_records:
+                exclusion_parts.append(f"{len(off_topic_records)} substantive but off-topic record(s) excluded")
+            if insufficient_records:
+                exclusion_parts.append(f"{len(insufficient_records)} insufficient length or empty record(s) excluded")
+
+            if non_sub_count > 0:
+                breakdown_str = f": {'; '.join(exclusion_parts)}" if exclusion_parts else ""
+                exclusion_clause = f"; {non_sub_count} non-substantive records excluded{breakdown_str}"
+            else:
+                exclusion_clause = ""
 
             if total_records == 0 or total_excerpt_words == 0:
                 status = "under_target_evidence_deficit"
@@ -142,31 +271,64 @@ def populate_script_duration_metrics(
                     f"({min_words}-{max_words} words, deficit: {deficit} words). No usable verified research "
                     f"evidence was available to sustain the requested duration without introducing ungrounded filler."
                 )
-            elif distinct_sources <= 1 or distinct_queries <= 1 or total_excerpt_words < 60 or vocab_ratio < 0.35:
+            elif (promotional_records or off_topic_records) and qualifying_count == 0:
                 status = "under_target_evidence_deficit"
                 note = (
                     f"Script duration ({total_words} words) is below target {script.target_duration_minutes:.1f} minutes "
-                    f"({min_words}-{max_words} words, deficit: {deficit} words). Available evidence has limited topic "
-                    f"coverage or repetitive content ({total_records} record(s) across {distinct_sources} source(s) and "
-                    f"{distinct_queries} query coverage, totaling {total_excerpt_words} excerpt words), providing insufficient "
-                    f"diverse material to sustain target duration without ungrounded filler."
+                    f"({min_words}-{max_words} words, deficit: {deficit} words). Although {total_records} evidence records "
+                    f"were retrieved, none contained substantive topic-relevant evidence{exclusion_clause}, "
+                    f"leaving insufficient factual material to sustain target duration."
                 )
-            elif total_records >= 2 and distinct_sources >= 2 and distinct_queries >= 2 and total_excerpt_words >= 100:
+            elif (
+                qualifying_count == 0
+                or qualifying_count == 1
+                or distinct_qualifying_sources <= 1
+                or distinct_qualifying_queries <= 1
+                or qualifying_excerpt_words < 80
+                or distinct_sources <= 1
+                or distinct_queries <= 1
+                or total_excerpt_words < 60
+                or vocab_ratio < 0.35
+            ):
+                status = "under_target_evidence_deficit"
+                if qualifying_count > 0:
+                    note = (
+                        f"Script duration ({total_words} words) is below target {script.target_duration_minutes:.1f} minutes "
+                        f"({min_words}-{max_words} words, deficit: {deficit} words). Available evidence has limited topic "
+                        f"coverage or repetitive content ({qualifying_count} substantive record(s) across {distinct_qualifying_sources} "
+                        f"source(s) and {distinct_qualifying_queries} query coverage, totaling {qualifying_excerpt_words} substantive excerpt words"
+                        f"{exclusion_clause}), providing insufficient diverse material to sustain target duration without ungrounded filler."
+                    )
+                else:
+                    note = (
+                        f"Script duration ({total_words} words) is below target {script.target_duration_minutes:.1f} minutes "
+                        f"({min_words}-{max_words} words, deficit: {deficit} words). Available evidence has limited topic "
+                        f"coverage or repetitive content ({total_records} record(s) across {distinct_sources} source(s) and "
+                        f"{distinct_queries} query coverage, totaling {total_excerpt_words} excerpt words{exclusion_clause}), "
+                        f"providing insufficient diverse material to sustain target duration without ungrounded filler."
+                    )
+            elif (
+                qualifying_count >= 2
+                and distinct_qualifying_sources >= 2
+                and distinct_qualifying_queries >= 2
+                and qualifying_excerpt_words >= 100
+            ):
                 status = "under_target_generator_shortfall"
                 note = (
                     f"Script duration ({total_words} words) is below target {script.target_duration_minutes:.1f} minutes "
                     f"({min_words}-{max_words} words, deficit: {deficit} words). Adequate substantive research evidence was "
-                    f"available ({total_records} records across {distinct_sources} sources and {distinct_queries} queries, "
-                    f"{total_excerpt_words} excerpt words), but generator produced a concise script without expanding into full target duration."
+                    f"available ({qualifying_count} substantive records across {distinct_qualifying_sources} sources and "
+                    f"{distinct_qualifying_queries} queries, {qualifying_excerpt_words} substantive excerpt words{exclusion_clause}), "
+                    f"but generator produced a concise script without expanding into full target duration."
                 )
             else:
-                # Borderline evidence (e.g. 2 records from 2 sources but low word count or marginal coverage)
+                # Borderline evidence
                 status = "under_target_undetermined"
                 note = (
                     f"Script duration ({total_words} words) is below target {script.target_duration_minutes:.1f} minutes "
-                    f"({min_words}-{max_words} words, deficit: {deficit} words). Evidence coverage ({total_records} records, "
-                    f"{distinct_sources} sources, {total_excerpt_words} words) is borderline, preventing confident attribution "
-                    f"between research evidence constraints and generator brevity."
+                    f"({min_words}-{max_words} words, deficit: {deficit} words). Evidence coverage ({qualifying_count} qualifying records, "
+                    f"{distinct_qualifying_sources} sources, {qualifying_excerpt_words} words{exclusion_clause}) is borderline, "
+                    f"preventing confident attribution between research evidence constraints and generator brevity."
                 )
         elif evidence_count is not None:
             # Fallback when only count is passed without record details
@@ -188,16 +350,15 @@ def populate_script_duration_metrics(
                 status = "under_target_undetermined"
                 note = (
                     f"Script duration ({total_words} words) is below target {script.target_duration_minutes:.1f} minutes "
-                    f"({min_words}-{max_words} words, deficit: {deficit} words). Available evidence count ({evidence_count}) "
-                    f"without content/coverage inspection is insufficient to definitively distinguish evidence deficit from generator shortfall."
+                    f"({min_words}-{max_words} words, deficit: {deficit} words). Evidence count ({evidence_count}) is "
+                    f"borderline, preventing confident attribution between research evidence constraints and generator brevity."
                 )
         else:
-            # Neither records nor count provided: honest uncertainty
             status = "under_target_undetermined"
             note = (
                 f"Script duration ({total_words} words) is below target {script.target_duration_minutes:.1f} minutes "
                 f"({min_words}-{max_words} words, deficit: {deficit} words). Insufficient research metadata available "
-                f"to determine whether deficit stems from research constraints or generator brevity."
+                f"to determine whether duration deficit stems from source evidence constraints or model brevity."
             )
 
     script.duration_compliance = DurationComplianceReport(

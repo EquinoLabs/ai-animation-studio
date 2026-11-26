@@ -1295,3 +1295,582 @@ def test_two_stage_exact_span_failure_end_to_end_regression(mock_catalog, sample
     assert result.fact_check_report.is_ready is False
     assert result.fact_check_report.contradicted_count == 1
 
+
+def test_missing_optional_fields_repaired_successfully_regression(mock_catalog, sample_script):
+    """Regression test for p7_live_validation_007:
+    Qwen2.5:7b omitted target_span and explanation from ClaimRepairPayload.
+    Verify:
+    1. Deserialization succeeds safely with target_span=None and default explanation.
+    2. Deterministic sentence resolution identifies the target sentence from narration.
+    3. The repair is validated and applied safely without throwing malformed JSON or dropping claims.
+    4. Recheck verifies the repaired claim.
+    """
+    script = sample_script.model_copy(deep=True)
+    script.sections = [sample_script.sections[1].model_copy(deep=True)]  # sec_02
+    target_claim = sample_script.claims[1].model_copy(deep=True)  # clm_02: "On Mars, liquid water lakes exist everywhere across the surface."
+    script.claims = [target_claim]
+    script.sections[0].claim_ids = [target_claim.claim_id]
+
+    report = ScriptFactCheckReport(
+        project_id="proj_alpha",
+        script_version=1,
+        research_run_id="run_test_01",
+        assessments=[
+            ClaimAssessment(
+                claim_id="clm_02",
+                section_id="sec_02",
+                proposition="On Mars, liquid water lakes exist everywhere across the surface.",
+                status="contradicted",
+                risk_level="high",
+                explanation="Contradicted by atmospheric pressure evidence.",
+                considered_evidence_ids=["evi_02"],
+                contradicting_evidence_ids=["evi_02"],
+                recommended_action="qualify",
+            )
+        ],
+    )
+    report.recompute_summary()
+
+    # Raw model JSON payload omitting target_span and explanation
+    omitted_fields_raw = {
+        "section_id": "sec_02",
+        "repairs": [
+            {
+                "claim_id": "clm_02",
+                "action": "qualify",
+                "replacement_span": "On Mars, liquid water vaporizes rapidly due to extremely low atmospheric pressure.",
+                "revised_claim_text": "On Mars, liquid water vaporizes rapidly due to extremely low atmospheric pressure.",
+                "evidence_ids": ["evi_02"],
+                # target_span OMITTED!
+                # explanation OMITTED!
+            }
+        ]
+    }
+    # 1. Verify deserialization succeeds safely with target_span=None and defaulted explanation
+    repaired_payload = SectionRepairPayload.model_validate(omitted_fields_raw)
+    assert repaired_payload.repairs[0].target_span is None
+    assert repaired_payload.repairs[0].explanation is not None  # Auto-filled safe default
+
+    # 2. Corrective retry returns the valid repair with explicit target_span
+    valid_retry_payload = SectionRepairPayload(
+        section_id="sec_02",
+        repairs=[
+            ClaimRepairPayload(
+                claim_id="clm_02",
+                action="qualify",
+                target_span="On Mars, liquid water lakes exist everywhere across the surface.",
+                replacement_span="On Mars, liquid water vaporizes rapidly due to extremely low atmospheric pressure.",
+                revised_claim_text="On Mars, liquid water vaporizes rapidly due to extremely low atmospheric pressure.",
+                evidence_ids=["evi_02"],
+                explanation="Model corrected missing target_span on retry.",
+            )
+        ],
+    )
+
+    recheck_payload = BatchFactCheckResponsePayload(
+        assessments=[
+            ClaimAssessmentPayload(
+                claim_id="clm_05",
+                status="supported",
+                explanation="Supported by evi_02.",
+                supporting_evidence_ids=["evi_02"],
+            )
+        ]
+    )
+
+    llm = MockLLMProvider()
+    # Call 1: initial repair (omits target_span -> validation rejects)
+    # Call 2: corrective retry (supplies target_span -> validation passes)
+    # Call 3: fact-checker recheck
+    llm.queue_responses([repaired_payload, valid_retry_payload, recheck_payload])
+
+    repairer = ScriptRepairer(llm_provider=llm)
+    known_ids = {"clm_01", "clm_02", "clm_03", "clm_04"}
+    result = repairer.repair_script(script, report, mock_catalog, all_known_claim_ids=known_ids)
+
+    # Verify corrective retry resolved the issue safely without crashing
+    assert len(llm.calls) == 3  # initial repair + corrective retry + recheck
+    assert result.attempted_claims_count == 1
+    assert result.resolved_claims_count == 1
+    assert result.is_fully_resolved is True
+
+    # Verify target_span was replaced in narration
+    repaired_sec = result.repaired_script.sections[0]
+    assert "On Mars, liquid water vaporizes rapidly due to extremely low atmospheric pressure." in repaired_sec.narration
+    assert "On Mars, liquid water lakes exist everywhere across the surface." not in repaired_sec.narration
+
+
+def test_claim_proposition_rejected_as_target_span_with_actionable_feedback():
+    """Verify that submitting claim proposition as target_span is rejected with specific diagnostic feedback."""
+    narration = (
+        "First, imagine you're walking into your kitchen in the morning. "
+        "A trigger or sensory cue—like the sound of your coffee machine or seeing an empty mug on the counter—initiates a habit sequence. "
+        "Your brain recognizes these cues and begins to activate specific neural pathways."
+    )
+    section = ScriptSection(
+        id="sec_03",
+        type="middle",
+        narration=narration,
+        claim_ids=["clm_03"],
+    )
+    claim = ScriptClaim(
+        claim_id="clm_03",
+        section_id="sec_03",
+        claim_text="Triggers or sensory cues initiate a habit sequence.",
+        evidence_ids=[],
+        risk_level="high",
+    )
+    repairer = ScriptRepairer(llm_provider=MockLLMProvider())
+
+    # Model mistakenly used the proposition text as target_span
+    payload = SectionRepairPayload(
+        section_id="sec_03",
+        repairs=[
+            ClaimRepairPayload(
+                claim_id="clm_03",
+                action="remove",
+                target_span="Triggers or sensory cues initiate a habit sequence.",  # Proposition text!
+                replacement_span="",
+                revised_claim_text=None,
+                evidence_ids=[],
+                explanation="Removing unverified claim.",
+            )
+        ],
+    )
+
+    is_valid, err = repairer._validate_section_repair_response(
+        payload=payload,
+        section=section,
+        target_claims=[claim],
+        catalog=None,
+        supplied_eids_by_claim={"clm_03": set()},
+    )
+
+    assert is_valid is False
+    assert "target_span was submitted as the abstract claim proposition" in err
+    assert "The claim proposition is not the narration sentence." in err
+    assert "The target span must be copied exactly from the supplied narration text." in err
+    assert "A trigger or sensory cue—like the sound of your coffee machine" in err
+
+
+def test_corrective_retry_recovering_from_proposition_confusion_regression(mock_catalog):
+    """Regression test for p7_live_validation_008:
+    1. Initial LLM repair submits proposition text as target_span.
+    2. Validator rejects with proposition-confusion diagnostic error.
+    3. Corrective retry receives feedback with exact sentence hint and returns verbatim sentence.
+    4. Surgical repair succeeds, original claim is replaced, and recheck verifies repaired script.
+    """
+    narration = (
+        "This mechanism of habit formation isn't just about mindless actions. "
+        "A trigger or sensory cue—like the sound of your coffee machine—initiates a habit sequence. "
+        "Over time, repetition solidifies the behavior."
+    )
+    section = ScriptSection(
+        id="sec_03",
+        type="middle",
+        narration=narration,
+        claim_ids=["clm_03"],
+    )
+    claim = ScriptClaim(
+        claim_id="clm_03",
+        section_id="sec_03",
+        claim_text="Triggers or sensory cues initiate a habit sequence.",
+        evidence_ids=["evi_01"],
+        risk_level="high",
+    )
+    script = Script(
+        script_id="scr_live_08",
+        project_id="proj_alpha",
+        version=1,
+        status="draft",
+        title="Habit Formation",
+        topic="Habit Formation",
+        target_duration_minutes=1.0,
+        sections=[section],
+        claims=[claim],
+        research_run_id="run_test_01",
+    )
+    report = ScriptFactCheckReport(
+        project_id="proj_alpha",
+        script_version=1,
+        research_run_id="run_test_01",
+        assessments=[
+            ClaimAssessment(
+                claim_id="clm_03",
+                section_id="sec_03",
+                proposition="Triggers or sensory cues initiate a habit sequence.",
+                status="unsupported",
+                risk_level="high",
+                explanation="No evidence supporting triggers or cues.",
+                considered_evidence_ids=["evi_01"],
+                recommended_action="qualify",
+            )
+        ],
+    )
+    report.recompute_summary()
+
+    # Call 1 payload: Fails due to proposition confusion
+    failed_payload = SectionRepairPayload(
+        section_id="sec_03",
+        repairs=[
+            ClaimRepairPayload(
+                claim_id="clm_03",
+                action="qualify",
+                target_span="Triggers or sensory cues initiate a habit sequence.",  # Proposition!
+                replacement_span="Water freezes into crystalline ice at zero degrees Celsius under standard atmospheric pressure.",
+                revised_claim_text="Water freezes into crystalline ice at zero degrees Celsius under standard atmospheric pressure.",
+                evidence_ids=["evi_01"],
+                explanation="Qualifying claim per evidence.",
+            )
+        ],
+    )
+
+    # Call 2 payload: Corrective retry succeeds using the verbatim narration sentence
+    valid_retry_payload = SectionRepairPayload(
+        section_id="sec_03",
+        repairs=[
+            ClaimRepairPayload(
+                claim_id="clm_03",
+                action="qualify",
+                target_span="A trigger or sensory cue—like the sound of your coffee machine—initiates a habit sequence.",
+                replacement_span="Water freezes into crystalline ice at zero degrees Celsius under standard atmospheric pressure.",
+                revised_claim_text="Water freezes into crystalline ice at zero degrees Celsius under standard atmospheric pressure.",
+                evidence_ids=["evi_01"],
+                explanation="Qualifying claim with exact verbatim target span.",
+            )
+        ],
+    )
+
+    # Call 3 payload: Recheck assessment
+    recheck_payload = BatchFactCheckResponsePayload(
+        assessments=[
+            ClaimAssessmentPayload(
+                claim_id="clm_05",
+                status="supported",
+                explanation="Supported by evi_01: Water freezes into crystalline ice at exactly 0 degrees Celsius under standard atmospheric pressure (1 atm).",
+                supporting_evidence_ids=["evi_01"],
+            )
+        ]
+    )
+
+    llm = MockLLMProvider()
+    llm.queue_responses([failed_payload, valid_retry_payload, recheck_payload])
+
+    repairer = ScriptRepairer(llm_provider=llm)
+    result = repairer.repair_script(
+        script=script,
+        report=report,
+        catalog=mock_catalog,
+        all_known_claim_ids={"clm_01", "clm_02", "clm_03", "clm_04"},
+    )
+
+    assert len(llm.calls) == 3  # initial repair + corrective retry + recheck
+    assert result.attempted_claims_count == 1
+    assert result.resolved_claims_count == 1
+    assert result.is_fully_resolved is True
+
+    # Verify narration was surgically updated
+    repaired_narration = result.repaired_script.sections[0].narration
+    assert "Water freezes into crystalline ice at zero degrees Celsius under standard atmospheric pressure." in repaired_narration
+    assert "A trigger or sensory cue—like the sound of your coffee machine—initiates a habit sequence." not in repaired_narration
+
+
+def test_repeated_proposition_confusion_safely_preserves_unresolved_claim(mock_catalog):
+    """Verify that if LLM repeats proposition confusion on retry, repair safely fails and preserves original claim."""
+    narration = "A trigger or sensory cue—like the sound of coffee—initiates a habit sequence."
+    section = ScriptSection(
+        id="sec_03",
+        type="middle",
+        narration=narration,
+        claim_ids=["clm_03"],
+    )
+    claim = ScriptClaim(
+        claim_id="clm_03",
+        section_id="sec_03",
+        claim_text="Triggers or sensory cues initiate a habit sequence.",
+        evidence_ids=["evi_01"],
+        risk_level="high",
+    )
+    script = Script(
+        script_id="scr_live_08_fail",
+        project_id="proj_alpha",
+        version=1,
+        status="draft",
+        title="Habit Formation",
+        topic="Habit Formation",
+        target_duration_minutes=1.0,
+        sections=[section],
+        claims=[claim],
+        research_run_id="run_test_01",
+    )
+    report = ScriptFactCheckReport(
+        project_id="proj_alpha",
+        script_version=1,
+        research_run_id="run_test_01",
+        assessments=[
+            ClaimAssessment(
+                claim_id="clm_03",
+                section_id="sec_03",
+                proposition="Triggers or sensory cues initiate a habit sequence.",
+                status="unsupported",
+                risk_level="high",
+                explanation="No evidence.",
+                considered_evidence_ids=["evi_01"],
+                recommended_action="remove",
+            )
+        ],
+    )
+    report.recompute_summary()
+
+    # Call 1 and Call 2 both return proposition text
+    bad_payload = SectionRepairPayload(
+        section_id="sec_03",
+        repairs=[
+            ClaimRepairPayload(
+                claim_id="clm_03",
+                action="remove",
+                target_span="Triggers or sensory cues initiate a habit sequence.",
+                replacement_span="",
+                revised_claim_text=None,
+                evidence_ids=[],
+                explanation="Remove.",
+            )
+        ],
+    )
+
+    llm = MockLLMProvider()
+    llm.queue_responses([bad_payload, bad_payload])
+
+    repairer = ScriptRepairer(llm_provider=llm)
+    result = repairer.repair_script(
+        script=script,
+        report=report,
+        catalog=mock_catalog,
+        all_known_claim_ids={"clm_01", "clm_02", "clm_03"},
+    )
+
+    # Initial repair + 1 corrective retry (bounded, no infinite loop)
+    assert len(llm.calls) == 2
+    assert result.attempted_claims_count == 1
+    assert result.resolved_claims_count == 0
+    assert result.unresolved_claims_count == 1
+    assert result.is_fully_resolved is False
+
+    # Original section and claim preserved intact without corruption
+    assert result.repaired_script.sections[0].narration == narration
+    assert result.repaired_script.claims[0].claim_text == claim.claim_text
+
+
+def test_resolve_claim_narration_sentence_unit_tests():
+    """Verify deterministic claim-to-narration sentence resolution across varied sentence structures."""
+    from backend.app.services.scriptwriter.repairer import _resolve_claim_narration_sentence
+
+    # 1. Empty edge cases
+    assert _resolve_claim_narration_sentence("", "Some narration text.") is None
+    assert _resolve_claim_narration_sentence("Some claim.", "") is None
+
+    # 2. Exact match
+    narration_1 = "First sentence introduces the topic. Water freezes at zero degrees Celsius. Concluding thought."
+    assert _resolve_claim_narration_sentence("Water freezes at zero degrees Celsius.", narration_1) == "Water freezes at zero degrees Celsius."
+
+    # 3. Stemmed / Paraphrased proposition resolution
+    narration_2 = (
+        "This mechanism of habit formation isn't just about mindless actions; it's a finely tuned system. "
+        "A trigger or sensory cue—like the sound of your coffee machine or seeing an empty mug—initiates a habit sequence. "
+        "Your brain recognizes these cues and begins to activate specific neural pathways."
+    )
+    res_2 = _resolve_claim_narration_sentence("Triggers or sensory cues initiate a habit sequence.", narration_2)
+    assert res_2 == "A trigger or sensory cue—like the sound of your coffee machine or seeing an empty mug—initiates a habit sequence."
+
+    # 4. Complex neuroanatomy proposition
+    narration_3 = (
+        "First, imagine you are learning a new skill. "
+        "Next, neurochemical signals travel from the prefrontal cortex through the basal ganglia, with a particular focus on the putamen (Step 2). "
+        "Over time, repetition solidifies the routine."
+    )
+    res_3 = _resolve_claim_narration_sentence(
+        "Neurochemical signals travel from the prefrontal cortex through the basal ganglia, with particular focus on the putamen to make behaviors automatic.",
+        narration_3,
+    )
+    assert res_3 == "Next, neurochemical signals travel from the prefrontal cortex through the basal ganglia, with a particular focus on the putamen (Step 2)."
+
+    # 5. Non-matching claim returns None safely rather than guessing incorrectly
+    res_4 = _resolve_claim_narration_sentence(
+        "Quantum superposition enables parallel computation in cubits.",
+        narration_3,
+    )
+    assert res_4 is None
+
+
+def test_repair_rejects_hedging_of_unsupported_specifics():
+    """Verify that attempting to hedge unsupported anatomical/mechanistic specifics absent from evidence is rejected."""
+    narration = (
+        "Human behavior follows patterned cycles. "
+        "The prefrontal cortex and basal ganglia coordinate every habit sequence. "
+        "Through repetition, actions become effortless."
+    )
+    section = ScriptSection(id="sec_02", type="middle", narration=narration, claim_ids=["clm_14"])
+    claim = ScriptClaim(
+        claim_id="clm_14",
+        section_id="sec_02",
+        claim_text="The prefrontal cortex and basal ganglia coordinate habit sequences.",
+        evidence_ids=["evi_01"],
+        risk_level="high",
+    )
+    # Evidence only talks about general neural pathways and neuroplasticity, NOT prefrontal cortex or basal ganglia
+    catalog = ValidatedEvidenceCatalog(
+        run_id="run_01",
+        evidence_by_id={
+            "evi_01": EvidenceRecord(
+                evidence_id="evi_01",
+                source_id="src_01",
+                project_id="proj_01",
+                run_id="run_01",
+                excerpt="Research demonstrates that repeated behaviors strengthen neural pathways through neuroplasticity.",
+            )
+        },
+        sources_by_id={},
+    )
+    repairer = ScriptRepairer(llm_provider=MockLLMProvider())
+
+    # Repair payload attempts to hedge the unsupported anatomical structures
+    payload = SectionRepairPayload(
+        section_id="sec_02",
+        repairs=[
+            ClaimRepairPayload(
+                claim_id="clm_14",
+                action="qualify",
+                target_span="The prefrontal cortex and basal ganglia coordinate every habit sequence.",
+                replacement_span="While not explicitly proven, the prefrontal cortex may coordinate habit sequences.",
+                revised_claim_text="The prefrontal cortex may coordinate habit sequences.",
+                evidence_ids=["evi_01"],
+                explanation="Hedging prefrontal cortex claim.",
+            )
+        ],
+    )
+
+    is_valid, err = repairer._validate_section_repair_response(
+        payload=payload,
+        section=section,
+        target_claims=[claim],
+        catalog=catalog,
+        supplied_eids_by_claim={"clm_14": {"evi_01"}},
+    )
+    assert not is_valid
+    assert "preserved unsupported specific detail(s)" in err
+    assert "prefrontal" in err
+    assert "Hedging unsupported specifics is prohibited" in err
+
+
+def test_repair_accepts_replacing_or_removing_unsupported_specifics():
+    """Verify that replacing unsupported specifics with supported general statements or removing them succeeds and preserves surrounding narration."""
+    narration = (
+        "Human behavior follows patterned cycles. "
+        "The prefrontal cortex and basal ganglia coordinate every habit sequence. "
+        "Through repetition, actions become effortless."
+    )
+    section = ScriptSection(id="sec_02", type="middle", narration=narration, claim_ids=["clm_14"])
+    claim = ScriptClaim(
+        claim_id="clm_14",
+        section_id="sec_02",
+        claim_text="The prefrontal cortex and basal ganglia coordinate habit sequences.",
+        evidence_ids=["evi_01"],
+        risk_level="high",
+    )
+    catalog = ValidatedEvidenceCatalog(
+        run_id="run_01",
+        evidence_by_id={
+            "evi_01": EvidenceRecord(
+                evidence_id="evi_01",
+                source_id="src_01",
+                project_id="proj_01",
+                run_id="run_01",
+                excerpt="Research demonstrates that repeated behaviors strengthen neural pathways through neuroplasticity.",
+            )
+        },
+        sources_by_id={},
+    )
+    repairer = ScriptRepairer(llm_provider=MockLLMProvider())
+
+    # 1. Successful replacement with supported general concept
+    payload_rephrase = SectionRepairPayload(
+        section_id="sec_02",
+        repairs=[
+            ClaimRepairPayload(
+                claim_id="clm_14",
+                action="rephrase",
+                target_span="The prefrontal cortex and basal ganglia coordinate every habit sequence.",
+                replacement_span="Repeated behaviors strengthen neural pathways through neuroplasticity.",
+                revised_claim_text="Repeated behaviors strengthen neural pathways through neuroplasticity.",
+                evidence_ids=["evi_01"],
+                explanation="Replaced unsupported anatomical structures with verified neural pathways evidence.",
+            )
+        ],
+    )
+    is_valid, err = repairer._validate_section_repair_response(
+        payload=payload_rephrase,
+        section=section,
+        target_claims=[claim],
+        catalog=catalog,
+        supplied_eids_by_claim={"clm_14": {"evi_01"}},
+    )
+    assert is_valid
+    assert err is None
+
+    # Apply replacement and check surrounding narration
+    applied = repairer._apply_section_repairs(
+        payload=payload_rephrase,
+        section=section,
+        target_claims=[claim],
+        target_assessments={"clm_14": ClaimAssessment(claim_id="clm_14", section_id="sec_02", proposition=claim.claim_text, status="unsupported", risk_level="high", explanation="Unsupported anatomy.")},
+        catalog=catalog,
+        known_ids={"clm_14"},
+    )
+    new_narration = applied["revised_narration"]
+    assert "Human behavior follows patterned cycles." in new_narration
+    assert "Through repetition, actions become effortless." in new_narration
+    assert "Repeated behaviors strengthen neural pathways through neuroplasticity." in new_narration
+    assert "prefrontal cortex" not in new_narration
+
+    # 2. Successful removal
+    payload_remove = SectionRepairPayload(
+        section_id="sec_02",
+        repairs=[
+            ClaimRepairPayload(
+                claim_id="clm_14",
+                action="remove",
+                target_span="The prefrontal cortex and basal ganglia coordinate every habit sequence.",
+                replacement_span="",
+                revised_claim_text=None,
+                evidence_ids=[],
+                explanation="Removed unsupported anatomical claim.",
+            )
+        ],
+    )
+    is_valid_rem, err_rem = repairer._validate_section_repair_response(
+        payload=payload_remove,
+        section=section,
+        target_claims=[claim],
+        catalog=catalog,
+        supplied_eids_by_claim={"clm_14": {"evi_01"}},
+    )
+    assert is_valid_rem
+    assert err_rem is None
+
+    applied_rem = repairer._apply_section_repairs(
+        payload=payload_remove,
+        section=section,
+        target_claims=[claim],
+        target_assessments={"clm_14": ClaimAssessment(claim_id="clm_14", section_id="sec_02", proposition=claim.claim_text, status="unsupported", risk_level="high", explanation="Unsupported anatomy.")},
+        catalog=catalog,
+        known_ids={"clm_14"},
+    )
+    rem_narration = applied_rem["revised_narration"]
+    assert "Human behavior follows patterned cycles." in rem_narration
+    assert "Through repetition, actions become effortless." in rem_narration
+    assert "prefrontal cortex" not in rem_narration
+
+
+
+
+

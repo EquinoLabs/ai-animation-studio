@@ -216,3 +216,43 @@ def test_prompt_builder_revision_integrity_and_evidence_semantics():
     # 5. Visual staging and structure are presented as adaptable guidance
     assert "ACTIONABLE VISUAL STAGING AS GUIDANCE" in gen_prompt
     assert "Visual cues are creative guidance" in gen_prompt
+
+
+def test_citation_policy_forbids_citing_everyday_illustrative_scenarios():
+    """Verify that writing policy explicitly forbids assigning citations to everyday illustrative scenarios."""
+    # 1. Anti-filler directives specify that everyday illustrative examples must not receive evidence citations
+    assert "EVERYDAY EXAMPLES AND ILLUSTRATIVE SCENARIOS" in ANTI_FILLER_DIRECTIVES
+    assert "MUST NOT receive evidence citations unless the cited research" in ANTI_FILLER_DIRECTIVES
+    assert "alarm clock, morning coffee, toothbrush routine" in ANTI_FILLER_DIRECTIVES
+
+    # 2. Generation prompt explicitly carries negative constraint
+    builder = ScriptPromptBuilder()
+    prompt = builder.build_script_generation_prompt(
+        topic="Habit Formation",
+        target_duration_minutes=3.0,
+        evidence_brief_text="- evi_01: Habit loops consist of cue, routine, reward.",
+    )
+    assert "NO CITATION OF ILLUSTRATIVE EXAMPLES" in prompt
+    assert "Everyday examples, hypothetical scenarios, metaphors, and illustrative narration" in prompt
+
+    # 3. Single-section prompt also carries the negative constraint
+    sec_prompt = builder.build_single_section_prompt(
+        topic="Habit Formation",
+        target_duration_minutes=3.0,
+        section_index=0,
+        total_sections=5,
+        section_type="hook",
+        heading="The Habit Loop",
+        target_words=100,
+        factual_milestones=["Cue and routine linkage"],
+        evidence_brief_text="- evi_01: Habit loops consist of cue, routine, reward.",
+        permitted_evidence_ids=["evi_01"],
+    )
+    assert "NO CITATION OF ILLUSTRATIVE EXAMPLES" in sec_prompt
+
+
+def test_factual_principles_in_illustrative_examples_still_require_grounding():
+    """Verify that factual principles within illustrative examples remain subject to grounding directives."""
+    assert "Factual principles and scientific mechanisms embedded within illustrative examples remain subject to" in ANTI_FILLER_DIRECTIVES
+    assert "strict grounding" in ANTI_FILLER_DIRECTIVES
+

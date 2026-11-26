@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 import re
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -23,6 +23,200 @@ SourceType = Literal["web_page", "scholarly", "encyclopedic", "primary", "news",
 RetrievalMethod = Literal["search_snippet", "full_extraction", "manual"]
 RetrievalStatus = Literal["discovered", "extracted", "failed", "unavailable"]
 EvidenceStatus = Literal["retrieved", "candidate", "discarded"]
+
+
+_TOPIC_STOPWORDS: Set[str] = {
+    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are",
+    "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but",
+    "by", "can", "could", "did", "do", "does", "doing", "down", "during", "each", "few", "for",
+    "from", "further", "had", "has", "have", "having", "he", "her", "here", "hers", "herself",
+    "him", "himself", "his", "how", "i", "if", "in", "into", "is", "it", "its", "itself", "just",
+    "me", "more", "most", "my", "myself", "no", "nor", "not", "now", "of", "off", "on", "once",
+    "only", "or", "other", "our", "ours", "ourselves", "out", "over", "own", "same", "she",
+    "should", "so", "some", "such", "than", "that", "the", "their", "theirs", "them", "themselves",
+    "then", "there", "these", "they", "this", "those", "through", "to", "too", "under", "until",
+    "up", "very", "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom",
+    "why", "will", "with", "would", "you", "your", "yours", "yourself", "yourselves",
+}
+
+_GENERIC_CONTEXT_WORDS: Set[str] = {
+    "work", "works", "worked", "working",
+    "form", "forms", "formed", "forming", "formation",
+    "use", "uses", "used", "using",
+    "make", "makes", "made", "making",
+    "way", "ways", "type", "types", "case", "cases",
+    "take", "takes", "took", "taking",
+    "help", "helps", "helped", "helping",
+    "time", "times", "good", "better", "best", "bad",
+    "start", "starts", "started", "starting",
+    "need", "needs", "needed",
+    "high", "higher", "highest", "low", "lower", "lowest",
+    "look", "looks", "looked", "looking",
+    "occur", "occurs", "occurred", "occurring",
+    "show", "shows", "showed", "showing",
+    "tell", "tells", "told", "step", "steps",
+    "part", "parts", "point", "points", "thing", "things",
+    # Broad/generic developmental and environmental terms that do not constitute habit mechanisms on their own:
+    "factor", "factors", "development", "influencing", "influence", "influences", "influenced",
+}
+
+
+def _canonical_root(word: str) -> str:
+    """Return the base morphological root of a substantive word."""
+    w = word.lower()
+    for suffix in ("ing", "tions", "tion", "ities", "ity", "ally", "al", "ical", "ic", "ed", "es", "s"):
+        if w.endswith(suffix) and len(w) - len(suffix) >= 3:
+            w = w[:-len(suffix)]
+            break
+    if len(w) >= 5:
+        return w[:5]
+    return w
+
+
+def extract_topic_tokens_and_stems(
+    *sources: Optional[str],
+) -> Tuple[Set[str], Set[str]]:
+    """Extract substantive domain tokens and morphological prefix stems from context strings."""
+    tokens: Set[str] = set()
+    stems: Set[str] = set()
+    for src in sources:
+        if not src:
+            continue
+        cleaned = re.sub(r"[^\w\s]", " ", src.lower())
+        for raw_w in cleaned.split():
+            w = raw_w.strip()
+            if len(w) >= 3 and w not in _TOPIC_STOPWORDS and not w.isdigit():
+                tokens.add(w)
+                if len(w) >= 5:
+                    stems.add(w[:5])
+                elif len(w) >= 4:
+                    stems.add(w[:4])
+                root = _canonical_root(w)
+                if len(root) >= 4:
+                    stems.add(root)
+    return tokens, stems
+
+
+def check_topical_relevance(
+    text: str,
+    heading: Optional[str],
+    tokens: Set[str],
+    stems: Set[str],
+    topic: Optional[str] = None,
+) -> Tuple[bool, Set[str], Set[str]]:
+    """Determine whether text demonstrates meaningful topical relevance to tokens/stems.
+
+    Enforces deterministic meaningful relevance:
+    - Rejects heading-only matches where body content has zero specific anchor matches.
+    - Rejects solitary incidental mentions (a single occurrence of 1 keyword with no other context).
+    - Rejects short prefix collisions from generic terms (e.g. 'work', 'form').
+    - Requires primary topic anchor (e.g. habit) when evaluating peripheral queries (e.g. environment, child development).
+    - Accepts multi-term contextual matches, repeated concentration, or adjacent topic phrases.
+    """
+    if not tokens and not stems:
+        return True, set(), set()
+
+    text_words = re.findall(r"\b[a-zA-Z0-9_-]+\b", text.lower())
+    text_words_set = set(text_words)
+    heading_words = re.findall(r"\b[a-zA-Z0-9_-]+\b", (heading or "").lower())
+    heading_words_set = set(heading_words)
+
+    # 0. Primary Topic Anchor Gate:
+    # If a broad overall research topic is provided (e.g. "Why do humans form habits..."),
+    # peripheral sub-queries (e.g. "environmental factors") must contain at least one primary topic anchor root
+    # in the text or heading to ensure generic content (e.g. child development, weather, economics) is not admitted.
+    # Exception: If the passage exhibits deep technical query convergence (>= 3 distinct specific concept roots),
+    # it is admitted as highly targeted scientific evidence.
+    specific_tokens = {t for t in tokens if t not in _GENERIC_CONTEXT_WORDS}
+    if not specific_tokens:
+        specific_tokens = set(tokens)
+    specific_roots = {_canonical_root(t) for t in specific_tokens}
+
+    matched_specific_roots: Set[str] = set()
+    body_specific_occurrences = 0
+    for w in text_words:
+        w_root = _canonical_root(w)
+        for r in specific_roots:
+            if w_root == r or (len(r) >= 4 and w.startswith(r)):
+                matched_specific_roots.add(r)
+                body_specific_occurrences += 1
+                break
+
+    if topic and len(matched_specific_roots) < 3:
+        topic_cleaned = re.sub(r"[^\w\s]", " ", topic.lower())
+        primary_topic_tokens = [
+            w for w in topic_cleaned.split()
+            if len(w) >= 4 and w not in _TOPIC_STOPWORDS and w not in _GENERIC_CONTEXT_WORDS
+        ]
+        primary_topic_roots = {_canonical_root(w) for w in primary_topic_tokens}
+        if primary_topic_roots:
+            has_topic_anchor = any(
+                _canonical_root(w) in primary_topic_roots
+                for w in (text_words + heading_words)
+            )
+            if not has_topic_anchor:
+                return False, set(), set()
+
+    # 3. All matches in content (tokens/stems) for backward compatibility and scoring
+    matched_content = {t for t in tokens if t in text_words_set} | {
+        s for s in stems
+        if any(w == s or (len(s) >= 4 and w.startswith(s)) for w in text_words_set)
+    }
+
+    # 4. Heading matches
+    matched_heading = {t for t in tokens if t in heading_words_set} | {
+        s for s in stems
+        if any(w == s or (len(s) >= 4 and w.startswith(s)) for w in heading_words_set)
+    }
+    matched_specific_heading_roots = {
+        r for w in heading_words
+        for r in specific_roots
+        if _canonical_root(w) == r or (len(r) >= 4 and w.startswith(r))
+    }
+
+    # 5. Check for adjacent topic token bigram in body (e.g. "habit formation", "basal ganglia")
+    has_adjacent_token_phrase = False
+    for i in range(len(text_words) - 1):
+        w1, w2 = text_words[i], text_words[i + 1]
+        w1_match = w1 in tokens or any(len(s) >= 4 and (w1 == s or w1.startswith(s)) for s in stems)
+        w2_match = w2 in tokens or any(len(s) >= 4 and (w2 == s or w2.startswith(s)) for s in stems)
+        if w1_match and w2_match and (w1 in specific_tokens or w2 in specific_tokens):
+            has_adjacent_token_phrase = True
+            break
+
+    heading_substantive_words = {
+        w for w in heading_words
+        if len(w) >= 4 and w not in _TOPIC_STOPWORDS and w not in _GENERIC_CONTEXT_WORDS
+    }
+    shared_heading_body_words = heading_substantive_words & text_words_set
+
+    # 6. Meaningful topical relevance decision
+    # - If heading has specific topic root AND body shares substantive concepts with that heading
+    if len(matched_specific_heading_roots) >= 1 and len(shared_heading_body_words) >= 1:
+        is_relevant = True
+    # - Must contain at least one specific body match (heading alone without body overlap NEVER qualifies)
+    elif len(matched_specific_roots) == 0:
+        is_relevant = False
+    # - Multi-term specific body matches (>= 2 distinct anchor concepts)
+    elif len(matched_specific_roots) >= 2:
+        is_relevant = True
+    # - Single specific anchor term, but validated by adjacent phrase
+    elif has_adjacent_token_phrase:
+        is_relevant = True
+    # - Single specific anchor term, with repeated concentration (>= 2 occurrences in body)
+    elif body_specific_occurrences >= 2:
+        is_relevant = True
+    # - Single specific anchor term confirmed by specific heading match AND contextual content
+    elif len(matched_specific_heading_roots) >= 1 and len(matched_content) >= 2:
+        is_relevant = True
+    # - Concise substantive definition (<= 25 words) with anchor keyword
+    elif len(text_words) <= 25 and len(matched_specific_roots) >= 1:
+        is_relevant = True
+    else:
+        # Solitary incidental mention without phrase, repetition, or heading confirmation
+        is_relevant = False
+
+    return is_relevant, matched_content, matched_heading
 
 
 # ---------------------------------------------------------------------------
